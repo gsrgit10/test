@@ -1,0 +1,249 @@
+dimport streamlit as st
+import requests
+import pandas as pd
+
+st.set_page_config(page_title="NPI Provider Search", page_icon="🔍", layout="wide")
+
+def search_npi_by_zip(zip_code):
+    """
+    Search NPI registry by zip code.
+    
+    Args:
+        zip_code: 5-digit or 9-digit zip code to search for providers
+    """
+    url = "https://npiregistry.cms.hhs.gov/api/"
+    
+    # Clean zip code - take first 5 digits
+    clean_zip = zip_code.strip().replace("-", "")[:5]
+    
+    params = {"version": "2.1", "postal_code": clean_zip, "limit": 200}
+    data = requests.get(url, params=params).json()
+    results = data.get("results", [])
+    
+    table_data = []
+    
+    for person in results:
+        # Extract Name
+        basic = person.get("basic", {})
+        first = basic.get("first_name", "")
+        last = basic.get("last_name", "")
+        full_name = f"{first} {last}"
+        
+        # Extract NPI
+        npi = person.get("number", "")
+        
+        # Extract address
+        addresses = person.get("addresses", [])
+        practice_addr = next((a for a in addresses if a["address_purpose"] == "LOCATION"), {})
+        address = f'{practice_addr.get("address_1", "")}, {practice_addr.get("city", "")}, {practice_addr.get("state", "")}'
+        
+        # Extract phone
+        phone = practice_addr.get("telephone_number", "")
+        
+        # Extract taxonomy (specialty)
+        taxonomy = ""
+        if "taxonomies" in person and len(person["taxonomies"]) > 0:
+            taxonomy = person["taxonomies"][0].get("desc", "")
+        
+        table_data.append({
+            "Name": full_name,
+            "NPI": npi,
+            "Specialty": taxonomy,
+            "Address": address,
+            "Phone": phone
+        })
+    
+    df = pd.DataFrame(table_data)
+    return df
+
+
+def search_npi(name):
+    """
+    Search NPI registry by name.
+    
+    Args:
+        name: Name to search for. Can be:
+              - Single name (e.g., "john" or "pandya") - searches as both first and last
+              - Full name (e.g., "Pandya Amy A." or "Amy Pandya") - parses and searches with both
+    """
+    url = "https://npiregistry.cms.hhs.gov/api/"
+    results = []
+    
+    # Split the name into parts
+    name_parts = name.strip().split()
+    
+    if len(name_parts) == 1:
+        # Single name - try as both first and last name
+        params = {"version": "2.1", "first_name": name}
+        data = requests.get(url, params=params).json()
+        first_results = data.get("results", [])
+        
+        params = {"version": "2.1", "last_name": name}
+        data = requests.get(url, params=params).json()
+        last_results = data.get("results", [])
+        
+        # Combine results, avoiding duplicates by NPI number
+        seen_npis = set()
+        for r in first_results + last_results:
+            npi = r.get("number")
+            if npi not in seen_npis:
+                seen_npis.add(npi)
+                results.append(r)
+    else:
+        # Multiple parts - try different combinations
+        # Remove middle initials (single letters with or without period)
+        clean_parts = [p.rstrip('.') for p in name_parts if len(p.rstrip('.')) > 1]
+        
+        if len(clean_parts) >= 2:
+            # Try both orderings: "Last First" and "First Last"
+            seen_npis = set()
+            
+            # Try first part as last name, second as first name (e.g., "Pandya Amy")
+            params = {"version": "2.1", "last_name": clean_parts[0], "first_name": clean_parts[1]}
+            data = requests.get(url, params=params).json()
+            for r in data.get("results", []):
+                npi = r.get("number")
+                if npi not in seen_npis:
+                    seen_npis.add(npi)
+                    results.append(r)
+            
+            # Try first part as first name, second as last name (e.g., "Amy Pandya")
+            params = {"version": "2.1", "first_name": clean_parts[0], "last_name": clean_parts[1]}
+            data = requests.get(url, params=params).json()
+            for r in data.get("results", []):
+                npi = r.get("number")
+                if npi not in seen_npis:
+                    seen_npis.add(npi)
+                    results.append(r)
+        else:
+            # Only one significant part after cleaning
+            single_name = clean_parts[0] if clean_parts else name_parts[0]
+            params = {"version": "2.1", "first_name": single_name}
+            data = requests.get(url, params=params).json()
+            first_results = data.get("results", [])
+            
+            params = {"version": "2.1", "last_name": single_name}
+            data = requests.get(url, params=params).json()
+            last_results = data.get("results", [])
+            
+            seen_npis = set()
+            for r in first_results + last_results:
+                npi = r.get("number")
+                if npi not in seen_npis:
+                    seen_npis.add(npi)
+                    results.append(r)
+    
+    table_data = []
+    
+    for person in results:
+        # Extract Name
+        basic = person.get("basic", {})
+        first = basic.get("first_name", "")
+        last = basic.get("last_name", "")
+        full_name = f"{first} {last}"
+        
+        # Extract NPI
+        npi = person.get("number", "")
+        
+        # Extract address
+        addresses = person.get("addresses", [])
+        practice_addr = next((a for a in addresses if a["address_purpose"] == "LOCATION"), {})
+        address = f'{practice_addr.get("address_1", "")}, {practice_addr.get("city", "")}, {practice_addr.get("state", "")}'
+        
+        # Extract phone
+        phone = practice_addr.get("telephone_number", "")
+        
+        # Extract taxonomy (specialty)
+        taxonomy = ""
+        if "taxonomies" in person and len(person["taxonomies"]) > 0:
+            taxonomy = person["taxonomies"][0].get("desc", "")
+        
+        table_data.append({
+            "Name": full_name,
+            "NPI": npi,
+            "Specialty": taxonomy,
+            "Address": address,
+            "Phone": phone
+        })
+    
+    df = pd.DataFrame(table_data)
+    return df
+
+
+# Streamlit UI
+st.title("🔍 NPI Provider Search")
+st.markdown("Search the NPI Registry for healthcare providers by name or zip code")
+
+# Search type selection
+search_type = st.radio("Search by:", ["Name", "Zip Code"], horizontal=True)
+
+# Search input
+with st.form("search_form"):
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        if search_type == "Name":
+            search_input = st.text_input(
+                "Provider Name",
+                placeholder="e.g., 'john', 'pandya', or 'Pandya Amy A.'",
+                help="Enter a single name or full name to search"
+            )
+        else:
+            search_input = st.text_input(
+                "Zip Code",
+                placeholder="e.g., '10001' or '10001-1234'",
+                help="Enter a 5-digit or 9-digit zip code to find providers in that area"
+            )
+    with col2:
+        st.write("")  # Spacer
+        st.write("")  # Spacer
+        search_button = st.form_submit_button("🔎 Search", use_container_width=True)
+
+# Search and display results
+if search_button and search_input:
+    with st.spinner("Searching NPI Registry..."):
+        if search_type == "Name":
+            df = search_npi(search_input)
+        else:
+            df = search_npi_by_zip(search_input)
+    
+    if df.empty:
+        if search_type == "Name":
+            st.warning("⚠️ No results found. Try a different name or spelling.")
+        else:
+            st.warning("⚠️ No results found. Try a different zip code.")
+    else:
+        st.success(f"✅ Found {len(df)} result(s)")
+        
+        # Display results in a table
+        st.dataframe(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Name": st.column_config.TextColumn("Name", width="medium"),
+                "NPI": st.column_config.TextColumn("NPI", width="small"),
+                "Specialty": st.column_config.TextColumn("Specialty", width="large"),
+                "Address": st.column_config.TextColumn("Address", width="large"),
+                "Phone": st.column_config.TextColumn("Phone", width="small")
+            }
+        )
+        
+        # Download button
+        csv = df.to_csv(index=False)
+        file_prefix = "name" if search_type == "Name" else "zip"
+        st.download_button(
+            label="📥 Download Results as CSV",
+            data=csv,
+            file_name=f"npi_search_{file_prefix}_{search_input.replace(' ', '_')}.csv",
+            mime="text/csv"
+        )
+
+elif search_button and not search_input:
+    if search_type == "Name":
+        st.error("Please enter a name to search")
+    else:
+        st.error("Please enter a zip code to search")
+
+# Footer
+st.markdown("---")
+st.markdown("*Data sourced from [NPPES NPI Registry](https://npiregistry.cms.hhs.gov/)*")
