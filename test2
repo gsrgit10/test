@@ -1,0 +1,380 @@
+# app/services/npi_registry.py
+from __future__ import annotations
+
+import requests
+from typing import Any, Dict, List, Optional, Set
+
+NPI_BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
+NPI_VERSION = "2.1"
+DEFAULT_LIMIT = 200
+DEFAULT_TIMEOUT = 20
+
+
+def _clean_zip(zip_code: str) -> str:
+    z = (zip_code or "").strip().replace("-", "")
+    return z[:5]
+
+
+def _extract_provider_row(person: Dict[str, Any]) -> Dict[str, Any]:
+    basic = person.get("basic") or {}
+    first = basic.get("first_name") or ""
+    last = basic.get("last_name") or ""
+    full_name = (f"{first} {last}").strip()
+
+    npi = person.get("number") or ""
+
+    addresses = person.get("addresses") or []
+    practice_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"), {}) or {}
+    address = ", ".join(
+        [x for x in [
+            practice_addr.get("address_1") or "",
+            practice_addr.get("city") or "",
+            practice_addr.get("state") or "",
+            _clean_zip(practice_addr.get("postal_code") or "")
+        ] if x]
+    )
+
+    phone = practice_addr.get("telephone_number") or ""
+
+    taxonomy = ""
+    taxonomies = person.get("taxonomies") or []
+    if taxonomies and isinstance(taxonomies, list):
+        taxonomy = (taxonomies[0].get("desc") or "") if isinstance(taxonomies[0], dict) else ""
+
+    return {
+        "Name": full_name,
+        "NPI": str(npi),
+        "Specialty": taxonomy,
+        "Address": address,
+        "Phone": phone,
+    }
+
+
+def npi_search_by_zip(zip_code: str, limit: int = DEFAULT_LIMIT, timeout: int = DEFAULT_TIMEOUT) -> List[Dict[str, Any]]:
+    clean_zip = _clean_zip(zip_code)
+    params = {"version": NPI_VERSION, "postal_code": clean_zip, "limit": limit}
+    resp = requests.get(NPI_BASE_URL, params=params, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json() or {}
+    results = data.get("results") or []
+
+    out: List[Dict[str, Any]] = []
+    for person in results:
+        if isinstance(person, dict):
+            out.append(_extract_provider_row(person))
+    return out
+
+
+def npi_search_by_name(name: str, limit: int = DEFAULT_LIMIT, timeout: int = DEFAULT_TIMEOUT) -> List[Dict[str, Any]]:
+    """
+    Matches your Streamlit logic:
+    - if single word: try as first_name and last_name and combine unique NPIs
+    - if multiple words: remove middle initials and try both (last, first) and (first, last)
+    """
+    nm = (name or "").strip()
+    if not nm:
+        return []
+
+    parts = nm.split()
+
+    def call(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        p = {"version": NPI_VERSION, "limit": limit, **params}
+        r = requests.get(NPI_BASE_URL, params=p, timeout=timeout)
+        r.raise_for_status()
+        j = r.json() or {}
+        return j.get("results") or []
+
+    seen: Set[str] = set()
+    combined: List[Dict[str, Any]] = []
+
+    def add_results(items: List[Dict[str, Any]]):
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            npi = str(it.get("number") or "").strip()
+            if not npi or npi in seen:
+                continue
+            seen.add(npi)
+            combined.append(it)
+
+    if len(parts) == 1:
+        add_results(call({"first_name": nm}))
+        add_results(call({"last_name": nm}))
+    else:
+        # remove middle initials like "A." or "A"
+        clean_parts = [p.rstrip(".") for p in parts if len(p.rstrip(".")) > 1]
+        if len(clean_parts) >= 2:
+            add_results(call({"last_name": clean_parts[0], "first_name": clean_parts[1]}))
+            add_results(call({"first_name": clean_parts[0], "last_name": clean_parts[1]}))
+        else:
+            single = clean_parts[0] if clean_parts else parts[0]
+            add_results(call({"first_name": single}))
+            add_results(call({"last_name": single}))
+
+    out: List[Dict[str, Any]] = []
+    for person in combined:
+        out.append(_extract_provider_row(person))
+
+    return out
+========================================
+# app/graph/routing.py
+
+def route_from_menu(state):
+    txt = (state.get("csr_query") or "").strip().lower()
+
+    # existing mappings...
+    if "assign" in txt and "pcp" in txt:
+        return "assign_pcp"
+    if "specialist" in txt:
+        return "specialist"
+
+    # NEW: NPI web search option
+    if "npi" in txt or "search provider npi" in txt or "provider npi" in txt:
+        return "npi"
+    if txt in ("3", "option 3"):
+        # only if your UI sends numeric choice; safe fallback
+        return "npi"
+
+    return "unsupported"
+===============================================
+#3.1
+menu_text = (
+    "You can choose one of the following options:<br>"
+    "1. Assign PCP<br>"
+    "2. Search for specialist<br>"
+    "3. Search Provider NPI (Web)"
+)
+==================================
+#3.2
+state["prompts"] = settings.DEFAULT_PROMPTS
+
+DEFAULT_PROMPTS = ["Assign PCP", "Search for specialist", "Search Provider NPI (Web)"]
+
+====================================
+#4.1
+from app.services.npi_registry import npi_search_by_zip, npi_search_by_name
+===========================
+#4.2
+def node_npi_ask_mode(state: PCPState) -> PCPState:
+    """
+    NPI flow step 1:
+    Ask whether search is by Name or Zip, interrupt, store choice in npi_mode.
+    """
+    logger.debug("node_npi_ask_mode")
+
+    if state.get("npi_mode"):
+        return state
+
+    system_prompt = (
+        "You are a CSR assistant. Ask the member whether they want to search the NPI registry by "
+        "Name or Zip Code. The question must be short and clear."
+    )
+    user_prompt = "Ask: Search by Name or Zip Code?"
+    ai_msg = call_horizon(system_prompt, user_prompt).strip()
+    mark_llm(state)
+
+    state["ai_response"] = ""  # UI prompt title style
+    state["prompt_title"] = ai_msg or "Search by:"
+    state["prompts"] = ["Name", "Zip Code"]
+    state["ai_response_code"] = 101
+    state["ai_response_type"] = "AURA"
+    state["stage"] = "ASK_NPI_MODE"
+
+    requested = interrupt({
+        "prompt": state["prompt_title"],
+        "prompts": state["prompts"],
+        "stage": state["stage"],
+    })
+
+    mode = str(requested).strip().lower()
+    if "zip" in mode:
+        state["npi_mode"] = "zip"
+    else:
+        state["npi_mode"] = "name"
+
+    state["csr_query"] = ""  # keep clean; next node collects input
+    return state
+
+
+def node_npi_collect_query(state: PCPState) -> PCPState:
+    """
+    NPI flow step 2:
+    Ask user to enter Name or Zip depending on mode, interrupt, store in npi_query.
+    """
+    logger.debug("node_npi_collect_query")
+
+    if state.get("npi_query"):
+        return state
+
+    mode = (state.get("npi_mode") or "").strip().lower() or "name"
+
+    if mode == "zip":
+        sys = "You are a CSR assistant. Ask the member to enter a ZIP code to search NPI registry."
+        usr = "Ask: Please enter Zip Code."
+    else:
+        sys = "You are a CSR assistant. Ask the member to enter a provider name to search NPI registry."
+        usr = "Ask: Please enter Provider Name."
+
+    ai_msg = call_horizon(sys, usr).strip()
+    mark_llm(state)
+
+    state["ai_response"] = ai_msg
+    state["prompt_title"] = ""
+    state["prompts"] = []
+    state["ai_response_code"] = 103
+    state["ai_response_type"] = "Dialog"
+    state["stage"] = "ASK_NPI_QUERY"
+
+    requested = interrupt({
+        "prompt": state["ai_response"],
+        "stage": state["stage"],
+    })
+
+    state["npi_query"] = str(requested).strip()
+    state["csr_query"] = ""  # keep clean
+    return state
+
+
+def node_npi_run_search_and_show_menu(state: PCPState) -> PCPState:
+    """
+    NPI flow step 3:
+    Call NPPES API (service), return results JSON in ai_response,
+    and show menu prompts again (interrupt) so user can choose next flow.
+    """
+    logger.debug("node_npi_run_search_and_show_menu")
+
+    mode = (state.get("npi_mode") or "name").strip().lower()
+    query = (state.get("npi_query") or "").strip()
+
+    if not query:
+        state["ai_response"] = "Please enter a valid input to search NPI registry."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 101
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "NPI_ERROR"
+        return state
+
+    try:
+        if mode == "zip":
+            mark_api(state, npi_search_by_zip)   # <-- call source
+            rows = npi_search_by_zip(query)
+        else:
+            mark_api(state, npi_search_by_name)  # <-- call source
+            rows = npi_search_by_name(query)
+    except Exception as ex:
+        logger.exception("NPI registry call failed: %s", ex)
+        # mark_api already set before; keep response safe
+        state["ai_response"] = "Unable to fetch NPI registry results right now. Please try again later."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    payload = {
+        "searchType": mode,
+        "searchInput": query,
+        "count": len(rows),
+        "providers": rows,
+    }
+
+    # Show results as JSON + show menu prompts again (your requirement)
+    menu_prompts = getattr(settings, "MENU_PROMPTS", None)
+    if not isinstance(menu_prompts, list) or not menu_prompts:
+        menu_prompts = settings.DEFAULT_PROMPTS  # should include NPI label
+
+    state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
+    state["ai_response_type"] = "AURA"
+    state["ai_response_code"] = 120
+    state["prompt_title"] = "What would you like to do next?"
+    state["prompts"] = menu_prompts
+    state["stage"] = "NPI_DONE_SHOW_MENU"
+
+    # interrupt so /chat returns results + prompts, and next click resumes into menu routing
+    requested = interrupt({
+        "prompt": state["ai_response"],
+        "stage": state["stage"],
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+
+    # resume value becomes next menu selection
+    state["csr_query"] = str(requested).strip()
+
+    # reset NPI fields so flow can run again later without stale data
+    state["npi_mode"] = None
+    state["npi_query"] = None
+
+    return state
+=================================
+  #5
+# app/graph/state.py (where PCPState is defined)
+
+npi_mode: str | None
+npi_query: str | None
+===============================
+#6.1
+builder.add_node("npi_ask_mode", node_npi_ask_mode)
+builder.add_node("npi_collect_query", node_npi_collect_query)
+builder.add_node("npi_run_search_and_show_menu", node_npi_run_search_and_show_menu)
+============================================
+#6.2
+builder.add_conditional_edges(
+    "start",
+    path=route_from_menu,
+    path_map={
+        "assign_pcp": "assign_pcp_ask_termination",
+        "specialist": "specialist_ask_service",
+        "npi": "npi_ask_mode",          # NEW
+        "unsupported": END,
+    },
+)
+
+And similarly for return_to_menu:
+
+builder.add_conditional_edges(
+    "return_to_menu",
+    path=route_from_menu,
+    path_map={
+        "assign_pcp": "assign_pcp_ask_termination",
+        "specialist": "specialist_ask_service",
+        "npi": "npi_ask_mode",          # NEW
+        "unsupported": END,
+    },
+)
+
+=================================
+#6.3
+builder.add_edge("npi_ask_mode", "npi_collect_query")
+builder.add_edge("npi_collect_query", "npi_run_search_and_show_menu")
+
+# After NPI results + menu prompt, route just like menu
+builder.add_conditional_edges(
+    "npi_run_search_and_show_menu",
+    path=route_from_menu,
+    path_map={
+        "assign_pcp": "assign_pcp_ask_termination",
+        "specialist": "specialist_ask_service",
+        "npi": "npi_ask_mode",
+        "unsupported": END,
+    },
+)
+================================
+#7
+mark_api(state, npi_search_by_zip)
+mark_api(state, npi_search_by_name)
+
+No changes are required in app/graph/call_source.py unless you want to explicitly label external HTTP calls differently. If you want that, add this optional helper:
+
+# app/graph/call_source.py (OPTIONAL)
+def mark_web_api(state, func):
+    state["call_type"] = "WEB_API"
+    state["call_name"] = getattr(func, "__name__", "unknown_web_api")
+
+========================================
+
+
