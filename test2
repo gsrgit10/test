@@ -1,380 +1,445 @@
-# app/services/npi_registry.py
-from __future__ import annotations
+parsers.py
+---------------
 
-import requests
-from typing import Any, Dict, List, Optional, Set
+from typing import Dict, Any, List
+import json
+import logging
+from app.llm.horizon_client import call_horizon
 
-NPI_BASE_URL = "https://npiregistry.cms.hhs.gov/api/"
-NPI_VERSION = "2.1"
-DEFAULT_LIMIT = 200
-DEFAULT_TIMEOUT = 20
+logger = logging.getLogger("pcp_app")
 
-
-def _clean_zip(zip_code: str) -> str:
-    z = (zip_code or "").strip().replace("-", "")
-    return z[:5]
-
-
-def _extract_provider_row(person: Dict[str, Any]) -> Dict[str, Any]:
-    basic = person.get("basic") or {}
-    first = basic.get("first_name") or ""
-    last = basic.get("last_name") or ""
-    full_name = (f"{first} {last}").strip()
-
-    npi = person.get("number") or ""
-
-    addresses = person.get("addresses") or []
-    practice_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"), {}) or {}
-    address = ", ".join(
-        [x for x in [
-            practice_addr.get("address_1") or "",
-            practice_addr.get("city") or "",
-            practice_addr.get("state") or "",
-            _clean_zip(practice_addr.get("postal_code") or "")
-        ] if x]
+# ---- LLM-based parsers (no regex helpers) ----
+def llm_validate_no_px_keys(filtered_case: Dict[str, Any]) -> Dict[str, Any]:
+    system = (
+        "You validate JSON objects.\n"
+        "Check whether any key anywhere in the JSON starts with 'px' (case-insensitive).\n"
+        "Return ONLY JSON:\n"
+        "{\"has_px\": boolean, \"examples\": [\"pxKey1\", \"pxKey2\"]}\n"
+        "examples should include up to 5 offending keys if any."
     )
+    raw = call_horizon(system, json.dumps(filtered_case)[:12000])  # cap to avoid token blowups
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        i = raw.find("{")
+        if i != -1:
+            raw = raw[i:]
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"has_px": None, "examples": []}
+    
+def llm_extract_provider_query_from_assign_text(user_text: str) -> Dict[str, Any]:
+    """
+    Extract provider search query from a free-form 'assign ... as pcp' message.
 
-    phone = practice_addr.get("telephone_number") or ""
-
-    taxonomy = ""
-    taxonomies = person.get("taxonomies") or []
-    if taxonomies and isinstance(taxonomies, list):
-        taxonomy = (taxonomies[0].get("desc") or "") if isinstance(taxonomies[0], dict) else ""
-
-    return {
-        "Name": full_name,
-        "NPI": str(npi),
-        "Specialty": taxonomy,
-        "Address": address,
-        "Phone": phone,
+    Returns ONLY JSON:
+    {
+      "search_type": "id" | "name_city_state" | "zip_only" | "unknown",
+      "provider_id": string | null,
+      "zip": string | null,
+      "name": string | null,
+      "city": string | null,
+      "state": string | null
     }
-
-
-def npi_search_by_zip(zip_code: str, limit: int = DEFAULT_LIMIT, timeout: int = DEFAULT_TIMEOUT) -> List[Dict[str, Any]]:
-    clean_zip = _clean_zip(zip_code)
-    params = {"version": NPI_VERSION, "postal_code": clean_zip, "limit": limit}
-    resp = requests.get(NPI_BASE_URL, params=params, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json() or {}
-    results = data.get("results") or []
-
-    out: List[Dict[str, Any]] = []
-    for person in results:
-        if isinstance(person, dict):
-            out.append(_extract_provider_row(person))
-    return out
-
-
-def npi_search_by_name(name: str, limit: int = DEFAULT_LIMIT, timeout: int = DEFAULT_TIMEOUT) -> List[Dict[str, Any]]:
     """
-    Matches your Streamlit logic:
-    - if single word: try as first_name and last_name and combine unique NPIs
-    - if multiple words: remove middle initials and try both (last, first) and (first, last)
-    """
-    nm = (name or "").strip()
-    if not nm:
-        return []
-
-    parts = nm.split()
-
-    def call(params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        p = {"version": NPI_VERSION, "limit": limit, **params}
-        r = requests.get(NPI_BASE_URL, params=p, timeout=timeout)
-        r.raise_for_status()
-        j = r.json() or {}
-        return j.get("results") or []
-
-    seen: Set[str] = set()
-    combined: List[Dict[str, Any]] = []
-
-    def add_results(items: List[Dict[str, Any]]):
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            npi = str(it.get("number") or "").strip()
-            if not npi or npi in seen:
-                continue
-            seen.add(npi)
-            combined.append(it)
-
-    if len(parts) == 1:
-        add_results(call({"first_name": nm}))
-        add_results(call({"last_name": nm}))
-    else:
-        # remove middle initials like "A." or "A"
-        clean_parts = [p.rstrip(".") for p in parts if len(p.rstrip(".")) > 1]
-        if len(clean_parts) >= 2:
-            add_results(call({"last_name": clean_parts[0], "first_name": clean_parts[1]}))
-            add_results(call({"first_name": clean_parts[0], "last_name": clean_parts[1]}))
-        else:
-            single = clean_parts[0] if clean_parts else parts[0]
-            add_results(call({"first_name": single}))
-            add_results(call({"last_name": single}))
-
-    out: List[Dict[str, Any]] = []
-    for person in combined:
-        out.append(_extract_provider_row(person))
-
-    return out
-========================================
-# app/graph/routing.py
-
-def route_from_menu(state):
-    txt = (state.get("csr_query") or "").strip().lower()
-
-    # existing mappings...
-    if "assign" in txt and "pcp" in txt:
-        return "assign_pcp"
-    if "specialist" in txt:
-        return "specialist"
-
-    # NEW: NPI web search option
-    if "npi" in txt or "search provider npi" in txt or "provider npi" in txt:
-        return "npi"
-    if txt in ("3", "option 3"):
-        # only if your UI sends numeric choice; safe fallback
-        return "npi"
-
-    return "unsupported"
-===============================================
-#3.1
-menu_text = (
-    "You can choose one of the following options:<br>"
-    "1. Assign PCP<br>"
-    "2. Search for specialist<br>"
-    "3. Search Provider NPI (Web)"
-)
-==================================
-#3.2
-state["prompts"] = settings.DEFAULT_PROMPTS
-
-DEFAULT_PROMPTS = ["Assign PCP", "Search for specialist", "Search Provider NPI (Web)"]
-
-====================================
-#4.1
-from app.services.npi_registry import npi_search_by_zip, npi_search_by_name
-===========================
-#4.2
-def node_npi_ask_mode(state: PCPState) -> PCPState:
-    """
-    NPI flow step 1:
-    Ask whether search is by Name or Zip, interrupt, store choice in npi_mode.
-    """
-    logger.debug("node_npi_ask_mode")
-
-    if state.get("npi_mode"):
-        return state
-
-    system_prompt = (
-        "You are a CSR assistant. Ask the member whether they want to search the NPI registry by "
-        "Name or Zip Code. The question must be short and clear."
+    system = (
+        "You extract provider-identifying info from a user request that intends to assign a PCP.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{\n"
+        '  "search_type": "id" | "name_city_state" | "zip_only" | "unknown",\n'
+        '  "provider_id": string | null,\n'
+        '  "zip": string | null,\n'
+        '  "name": string | null,\n'
+        '  "city": string | null,\n'
+        '  "state": string | null\n'
+        "}\n"
+        "Rules:\n"
+        "- If there is an 8-digit provider id anywhere in the text, use search_type='id' and set provider_id.\n"
+        "- Else if there is a provider name anywhere in the text (even if city/state/zip are NOT present), "
+        "use search_type='name_city_state' and set name. city/state/zip may be null.\n"
+        "- Else if there is a 5-digit ZIP and no provider id and no name, use search_type='zip_only' and set zip.\n"
+        "- Ignore filler words like 'please', 'assign', 'as pcp', etc.\n"
+        "Return JSON only."
     )
-    user_prompt = "Ask: Search by Name or Zip Code?"
-    ai_msg = call_horizon(system_prompt, user_prompt).strip()
-    mark_llm(state)
 
-    state["ai_response"] = ""  # UI prompt title style
-    state["prompt_title"] = ai_msg or "Search by:"
-    state["prompts"] = ["Name", "Zip Code"]
-    state["ai_response_code"] = 101
-    state["ai_response_type"] = "AURA"
-    state["stage"] = "ASK_NPI_MODE"
-
-    requested = interrupt({
-        "prompt": state["prompt_title"],
-        "prompts": state["prompts"],
-        "stage": state["stage"],
-    })
-
-    mode = str(requested).strip().lower()
-    if "zip" in mode:
-        state["npi_mode"] = "zip"
-    else:
-        state["npi_mode"] = "name"
-
-    state["csr_query"] = ""  # keep clean; next node collects input
-    return state
-
-
-def node_npi_collect_query(state: PCPState) -> PCPState:
+    raw = call_horizon(system, user_text).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        i = raw.find("{")
+        if i != -1:
+            raw = raw[i:]
+    try:
+        data = json.loads(raw)
+        st = (data.get("search_type") or "unknown").strip()
+        if st not in ("id", "name_city_state", "zip_only"):
+            st = "unknown"
+        return {
+            "search_type": st,
+            "provider_id": data.get("provider_id"),
+            "zip": data.get("zip"),
+            "name": data.get("name"),
+            "city": data.get("city"),
+            "state": data.get("state"),
+        }
+    except Exception:
+        logger.warning("Failed to parse assign-text provider JSON from LLM: %s", raw)
+        return {
+            "search_type": "unknown",
+            "provider_id": None,
+            "zip": None,
+            "name": None,
+            "city": None,
+            "state": None,
+        }
+    
+def llm_parse_zip_and_date(user_text: str) -> Dict[str, Any]:
     """
-    NPI flow step 2:
-    Ask user to enter Name or Zip depending on mode, interrupt, store in npi_query.
+    Ask Horizon to extract optional ZIP code and as-of date from user's provider input text.
+
+    Returns JSON:
+    {
+      "zip": string | null,        # 5-digit ZIP if present
+      "as_of_date": string | null  # YYYYMMDD if present, else null
+    }
     """
-    logger.debug("node_npi_collect_query")
+    system = (
+        "You are an AI that extracts ZIP code and an as-of date from a member's free-text provider search request.<br>"
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "zip": string | null,<br>'
+        '  "as_of_date": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- zip must be exactly 5 numeric digits if present.<br>"
+        "- as_of_date must be in YYYYMMDD format if present. If the user mentions a date in another format, "
+        "  convert it to YYYYMMDD. If no date is mentioned, use null.<br>"
+    )
+    raw = call_horizon(system, user_text)
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
+    try:
+        data = json.loads(raw)
+        zip_val = data.get("zip")
+        as_of = data.get("as_of_date")
+        return {
+            "zip": zip_val,
+            "as_of_date": as_of,
+        }
+    except Exception:
+        logger.warning("Failed to parse ZIP/date JSON from LLM: %s", raw)
+        return {"zip": None, "as_of_date": None}
+    
+def llm_parse_provider_input(user_text: str) -> Dict[str, Any]:
+    system = (
+        "You are an AI that extracts provider search parameters from free text.<br>"
+        "Return ONLY valid JSON with this schema:<br>"
+        "{<br>"
+        '  "search_type": "id" | "name_city_state" | "zip_only",<br>'
+        '  "provider_id": string | null,<br>'
+        '  "zip": string | null,<br>'
+        '  "name": string | null,<br>'
+        '  "city": string | null,<br>'
+        '  "state": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- If the input is ONLY an 8-digit number, it is a provider_id and search_type must be 'id'.<br>"
+        "- If the input is ONLY a 5-digit number, it is a ZIP code and search_type must be 'zip_only'.<br>"
+        "- If the user provides a provider name and city/state (optionally with zip), use search_type='name_city_state'.<br>"
+        "- zip must be exactly 5 digits if present.<br>"
+        "Return JSON only (no markdown, no explanation)."
+    )
+    raw = call_horizon(system, user_text).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
+    try:
+        return json.loads(raw)
+    except Exception:
+        logger.warning("Failed to parse provider input JSON from LLM: %s", raw)
+        # fallback: treat as name search (safer than calling provider_by_id incorrectly)
+        return {
+            "search_type": "name_city_state",
+            "provider_id": None,
+            "zip": None,
+            "name": user_text.strip() or None,
+            "city": None,
+            "state": None,
+        }
 
-    if state.get("npi_query"):
-        return state
 
-    mode = (state.get("npi_mode") or "").strip().lower() or "name"
-
-    if mode == "zip":
-        sys = "You are a CSR assistant. Ask the member to enter a ZIP code to search NPI registry."
-        usr = "Ask: Please enter Zip Code."
-    else:
-        sys = "You are a CSR assistant. Ask the member to enter a provider name to search NPI registry."
-        usr = "Ask: Please enter Provider Name."
-
-    ai_msg = call_horizon(sys, usr).strip()
-    mark_llm(state)
-
-    state["ai_response"] = ai_msg
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["ai_response_code"] = 103
-    state["ai_response_type"] = "Dialog"
-    state["stage"] = "ASK_NPI_QUERY"
-
-    requested = interrupt({
-        "prompt": state["ai_response"],
-        "stage": state["stage"],
-    })
-
-    state["npi_query"] = str(requested).strip()
-    state["csr_query"] = ""  # keep clean
-    return state
+def llm_parse_filter_input(user_text: str) -> Dict[str, Any]:
+    system = (
+        "You are an AI that extracts PCP search filters from free text. "
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "language": string | null,<br>'
+        '  "radius_in_miles": number | null,<br>'
+        '  "gender": "M" | "F" | null<br>'
+        "}<br>"
+        "Pick gender from M/F when user mentions male/female, man/woman, etc."
+    )
+    raw = call_horizon(system, user_text)
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
+    try:
+        data = json.loads(raw)
+        return data
+    except Exception:
+        logger.warning("Failed to parse filter JSON from LLM: %s", raw)
+        return {"language": None, "radius_in_miles": None, "gender": None}
 
 
-def node_npi_run_search_and_show_menu(state: PCPState) -> PCPState:
+def llm_decide_followup_action(user_text: str, providers: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    NPI flow step 3:
-    Call NPPES API (service), return results JSON in ai_response,
-    and show menu prompts again (interrupt) so user can choose next flow.
+    Decide what user wants after seeing provider grid.
+    Must detect:
+      - provider_id_only: user sent only provider id (no other words)
+      - address: user asks for address of a provider id
+      - assign_pcp: user asks to assign provider as PCP
+      - other
+    Returns ONLY JSON:
+      { "action": "provider_id_only"|"address"|"assign_pcp"|"other", "provider_id": string|null }
     """
-    logger.debug("node_npi_run_search_and_show_menu")
+    system = (
+        "You are an assistant that interprets a member's follow-up message after they received a provider list.<br>"
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "action": "provider_id_only" | "address" | "assign_pcp" | "other",<br>'
+        '  "provider_id": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- If the message contains ONLY a provider id (just digits, no other words), action must be 'provider_id_only'.<br>"
+        "- If the user asks for address/location of a provider, action='address'.<br>"
+        "- If the user asks to assign a provider as PCP, action='assign_pcp'.<br>"
+        "- provider_id must match one of the providerId values from the list when possible.<br>"
+        "Return JSON only."
+    )
 
-    mode = (state.get("npi_mode") or "name").strip().lower()
-    query = (state.get("npi_query") or "").strip()
+    providers_brief = [
+        {"providerId": str(p.get("providerId") or ""), "name": p.get("name")}
+        for p in (providers or [])
+    ]
 
-    if not query:
-        state["ai_response"] = "Please enter a valid input to search NPI registry."
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 101
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "NPI_ERROR"
-        return state
+    payload = {"message": user_text, "providers": providers_brief}
+    raw = call_horizon(system, json.dumps(payload)).strip()
+
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
 
     try:
-        if mode == "zip":
-            mark_api(state, npi_search_by_zip)   # <-- call source
-            rows = npi_search_by_zip(query)
-        else:
-            mark_api(state, npi_search_by_name)  # <-- call source
-            rows = npi_search_by_name(query)
-    except Exception as ex:
-        logger.exception("NPI registry call failed: %s", ex)
-        # mark_api already set before; keep response safe
-        state["ai_response"] = "Unable to fetch NPI registry results right now. Please try again later."
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 500
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "ERROR"
-        return state
+        return json.loads(raw)
+    except Exception:
+        logger.warning("Failed to parse followup action JSON from LLM: %s", raw)
+        return {"action": "other", "provider_id": None}
 
-    payload = {
-        "searchType": mode,
-        "searchInput": query,
-        "count": len(rows),
-        "providers": rows,
+def llm_parse_no_flow_filters(user_text: str) -> Dict[str, Any]:
+    """
+    Extract NO-flow filter inputs from user text.
+
+    Returns ONLY JSON:
+    {
+      "use_defaults": boolean,
+      "language": string | null,          # e.g. "Spanish"
+      "gender": "M" | "F" | null,         # normalize to M/F
+      "zip": string | null,               # 5-digit
+      "as_of_date": string | null,        # YYYYMMDD
+      "radius_in_miles": number | null    # only if user explicitly wants change
     }
+    """
+    system = (
+        "You are an AI that extracts PCP provider-search filters from text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{\n"
+        '  "use_defaults": boolean,\n'
+        '  "language": string | null,\n'
+        '  "gender": "M" | "F" | null,\n'
+        '  "zip": string | null,\n'
+        '  "as_of_date": string | null,\n'
+        '  "radius_in_miles": number | null\n'
+        "}\n"
+        "Rules:\n"
+        "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
+        "- Otherwise use_defaults=false.\n"
+        "- zip must be exactly 5 digits if present.\n"
+        "- gender must be M or F when user implies male/female; if unclear use null.\n"
+        "- If user provides a date in ANY format, convert to YYYYMMDD.\n"
+        "- Only set radius_in_miles if the user explicitly asks to change the default distance.\n"
+        "Return JSON only."
+    )
 
-    # Show results as JSON + show menu prompts again (your requirement)
-    menu_prompts = getattr(settings, "MENU_PROMPTS", None)
-    if not isinstance(menu_prompts, list) or not menu_prompts:
-        menu_prompts = settings.DEFAULT_PROMPTS  # should include NPI label
+    raw = call_horizon(system, user_text).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
 
-    state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 120
-    state["prompt_title"] = "What would you like to do next?"
-    state["prompts"] = menu_prompts
-    state["stage"] = "NPI_DONE_SHOW_MENU"
+    try:
+        data = json.loads(raw)
+        # Defensive defaults
+        return {
+            "use_defaults": bool(data.get("use_defaults", False)),
+            "language": data.get("language"),
+            "gender": data.get("gender"),
+            "zip": data.get("zip"),
+            "as_of_date": data.get("as_of_date"),
+            "radius_in_miles": data.get("radius_in_miles"),
+        }
+    except Exception:
+        logger.warning("Failed to parse NO-flow filter JSON from LLM: %s", raw)
+        return {
+            "use_defaults": False,
+            "language": None,
+            "gender": None,
+            "zip": None,
+            "as_of_date": None,
+            "radius_in_miles": None,
+        }
 
-    # interrupt so /chat returns results + prompts, and next click resumes into menu routing
-    requested = interrupt({
-        "prompt": state["ai_response"],
-        "stage": state["stage"],
-        "prompt_title": state["prompt_title"],
-        "prompts": state["prompts"],
-        "ai_response_code": state["ai_response_code"],
-        "ai_response_type": state["ai_response_type"],
-    })
+def llm_route_menu_intent(user_text: str) -> str:
+    """
+    Returns: "assign_pcp" | "specialist" | "unsupported"
+    Uses Horizon LLM so we can handle spelling mistakes and semantic variants.
+    """
+    system = (
+        "You are an intent classifier for a health plan CSR assistant.\n"
+        "Classify the user's menu choice into one of:\n"
+        '- "assign_pcp"\n'
+        '- "specialist"\n'
+        '- "unsupported"\n'
+        "Consider spelling mistakes and semantic variants.\n"
+        "Return ONLY JSON like: {\"intent\":\"assign_pcp\"}\n"
+    )
+    raw = call_horizon(system, user_text).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
+    try:
+        data = json.loads(raw)
+        intent = str(data.get("intent") or "").strip()
+        if intent in ("assign_pcp", "specialist", "unsupported"):
+            return intent
+        return "unsupported"
+    except Exception:
+        logger.warning("Failed to parse menu intent JSON from LLM: %s", raw)
+        return "unsupported"
 
-    # resume value becomes next menu selection
-    state["csr_query"] = str(requested).strip()
+def llm_parse_specialist_filters(user_text: str) -> Dict[str, Any]:
+    """
+    Extract specialist search filters from text.
 
-    # reset NPI fields so flow can run again later without stale data
-    state["npi_mode"] = None
-    state["npi_query"] = None
+    Returns ONLY JSON:
+    {
+      "use_defaults": boolean,
+      "language": string | null,
+      "gender": "M" | "F" | null,
+      "zip": string | null,
+      "as_of_date": string | null,        # YYYYMMDD
+      "radius_in_miles": number | null
+    }
+    """
+    system = (
+        "You are an AI that extracts Specialist provider-search filters from text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{\n"
+        '  "use_defaults": boolean,\n'
+        '  "language": string | null,\n'
+        '  "gender": "M" | "F" | null,\n'
+        '  "zip": string | null,\n'
+        '  "as_of_date": string | null,\n'
+        '  "radius_in_miles": number | null\n'
+        "}\n"
+        "Rules:\n"
+        "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
+        "- Otherwise use_defaults=false.\n"
+        "- zip must be exactly 5 digits if present.\n"
+        "- gender must be M or F when user implies male/female; if unclear use null.\n"
+        "- If user provides a date in ANY format, convert to YYYYMMDD.\n"
+        "- Only set radius_in_miles if the user explicitly wants to change the default distance.\n"
+        "Return JSON only."
+    )
 
-    return state
-=================================
-  #5
-# app/graph/state.py (where PCPState is defined)
+    raw = call_horizon(system, user_text).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
 
-npi_mode: str | None
-npi_query: str | None
-===============================
-#6.1
-builder.add_node("npi_ask_mode", node_npi_ask_mode)
-builder.add_node("npi_collect_query", node_npi_collect_query)
-builder.add_node("npi_run_search_and_show_menu", node_npi_run_search_and_show_menu)
-============================================
-#6.2
-builder.add_conditional_edges(
-    "start",
-    path=route_from_menu,
-    path_map={
-        "assign_pcp": "assign_pcp_ask_termination",
-        "specialist": "specialist_ask_service",
-        "npi": "npi_ask_mode",          # NEW
-        "unsupported": END,
-    },
-)
+    try:
+        data = json.loads(raw)
+        return {
+            "use_defaults": bool(data.get("use_defaults", False)),
+            "language": data.get("language"),
+            "gender": data.get("gender"),
+            "zip": data.get("zip"),
+            "as_of_date": data.get("as_of_date"),
+            "radius_in_miles": data.get("radius_in_miles"),
+        }
+    except Exception:
+        logger.warning("Failed to parse Specialist filter JSON from LLM: %s", raw)
+        return {
+            "use_defaults": False,
+            "language": None,
+            "gender": None,
+            "zip": None,
+            "as_of_date": None,
+            "radius_in_miles": None,
+        }
 
-And similarly for return_to_menu:
+========================================================
 
-builder.add_conditional_edges(
-    "return_to_menu",
-    path=route_from_menu,
-    path_map={
-        "assign_pcp": "assign_pcp_ask_termination",
-        "specialist": "specialist_ask_service",
-        "npi": "npi_ask_mode",          # NEW
-        "unsupported": END,
-    },
-)
+routing.py
+----------------
 
-=================================
-#6.3
-builder.add_edge("npi_ask_mode", "npi_collect_query")
-builder.add_edge("npi_collect_query", "npi_run_search_and_show_menu")
+from app.graph.state import PCPState
+from app.llm.parsers import llm_route_menu_intent
 
-# After NPI results + menu prompt, route just like menu
-builder.add_conditional_edges(
-    "npi_run_search_and_show_menu",
-    path=route_from_menu,
-    path_map={
-        "assign_pcp": "assign_pcp_ask_termination",
-        "specialist": "specialist_ask_service",
-        "npi": "npi_ask_mode",
-        "unsupported": END,
-    },
-)
-================================
-#7
-mark_api(state, npi_search_by_zip)
-mark_api(state, npi_search_by_name)
+def route_from_menu(state: PCPState) -> str:
+    text = (state.get("csr_query") or "").lower().strip()
 
-No changes are required in app/graph/call_source.py unless you want to explicitly label external HTTP calls differently. If you want that, add this optional helper:
-
-# app/graph/call_source.py (OPTIONAL)
-def mark_web_api(state, func):
-    state["call_type"] = "WEB_API"
-    state["call_name"] = getattr(func, "__name__", "unknown_web_api")
-
-========================================
+    if not text:
+        return "unsupported"
+    return llm_route_menu_intent(text)
 
 
+def route_knows_provider(state: PCPState) -> str:
+    if state.get("knows_provider"):
+        return "knows"
+    return "unknown"
+
+def route_after_provider_followup(state: PCPState) -> str:
+    if state.get("last_followup_action") == "assign_pcp":
+        return "assign"
+    if state.get("last_followup_action") == "provider_id_only":
+        return "pid_only"
+    return "loop"
+
+def route_after_specialist_completion(state: PCPState) -> str:
+    if state.get("stage") == "CLOSED":
+        return "end"
+    if state.get("stage") == "GO_MENU":
+        return "menu"
+    return "menu"
+
+def route_after_specialist_provider_address(state: PCPState) -> str:
+    # Only go to post-completion logic if we truly completed address inquiry
+    if state.get("stage") == "COMPLETED":
+        return "completed"
+    return "loop"
