@@ -1,315 +1,230 @@
-npi_origin: str | None                  # "menu" | "fallback"
-npi_results_payload: Dict[str, Any] | None
-npi_followup_text: str | None           # Horizon-generated instruction after results (fallback only)
+if not providers:
+    # mark that we are entering NPI flow as fallback from specialist
+    state["npi_origin"] = "fallback"
+    state["npi_target_flow"] = "specialist"
 
-# let NPI selection drive provider id search deterministically
-provider_id_override: str | None        # if set, run provider_search_by_id with this value
+    # clear any previous NPI state so NPI starts fresh
+    state.pop("npi_results_payload", None)
+    state.pop("npi_mode", None)
+    state.pop("npi_query", None)
+    state.pop("provider_id_override", None)
 
-==========================================================================================================
+    # IMPORTANT: return state such that your graph routes to npi_ask_mode
+    # (you already did this pattern for PCP fallback)
+    state["stage"] = "GO_NPI"
+    return state
 
-def route_after_npi_run_search(state: PCPState) -> str:
-    """
-    If NPI was entered from menu -> keep current behavior (results + menu).
-    If NPI was entered from fallback -> go to followup node (user selects NPI/address).
-    """
-    origin = (state.get("npi_origin") or "menu").strip().lower()
-    return "followup" if origin == "fallback" else "menu"
-
-=========================================================================================================
-
-state["npi_origin"] = "fallback"
-# also clear old npi state (safety)
-state.pop("npi_results_payload", None)
-state.pop("npi_mode", None)
-state.pop("npi_query", None)
-state.pop("npi_followup_text", None)
-
-
-state["npi_origin"] = "menu"
+=============================================================
 
 def node_npi_ask_mode(state: PCPState) -> PCPState:
-    ...
-    # If not already set by fallback, default to menu
+    logger.debug("node_npi_ask_mode")
+
+    # If not explicitly set by fallback, this is menu entry
     if not state.get("npi_origin"):
         state["npi_origin"] = "menu"
+    if not state.get("npi_target_flow"):
+        state["npi_target_flow"] = "pcp"   # default; fallback will override to "specialist"
+
+    # Always reset NPI search inputs when entering ask mode
+    state.pop("npi_results_payload", None)
+    state.pop("npi_query", None)
+    state.pop("npi_mode", None)
+
     ...
-=======================================================================================================
 
-    # Payload (ONLY providers)
-    payload: Dict[str, Any] = {"providers": providers}
 
-    state["npi_results_payload"] = payload
-    state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = getattr(settings, "NPI_RESULTS_CODE", 107)
+===============================================
 
-    origin = (state.get("npi_origin") or "menu").strip().lower()
+def node_run_specialist_id_search(state: PCPState) -> PCPState:
+    """
+    Specialist fallback after NPI selection:
+      - provider_id_override contains NPI (10-digit)
+      - calls provider_search_by_id(id=<NPI>, group_id/subscriber_id/asOfDate same as existing)
+      - shows grid using stage SHOW_SPECIALIST_PROVIDER_LIST
+      - next node remains specialist_provider_address (existing)
+    """
+    logger.debug("node_run_specialist_id_search")
 
-    if origin == "fallback":
-        # Horizon must generate instruction text (no hardcode)
+    pid = (state.get("provider_id_override") or "").strip()
+    if not pid:
+        # if missing, bounce back to NPI mode safely
+        state["stage"] = "NPI_ASK_MODE"
+        return state
+
+    # Clear override after consuming so it does not repeat
+    state["provider_id_override"] = None
+
+    group_id = (state.get("group_id") or "").strip()
+    subscriber_id = (state.get("subscriber_id") or "").strip()
+
+    if not group_id or not subscriber_id:
+        # Horizon error message (no hardcode)
         sys = (
-            "You are a CSR assistant.\n"
-            "The user is looking at NPI registry results and must choose next step.\n"
-            "Write a short PromptTitle that asks them to either:\n"
-            "- enter an NPI number from the list to search providers by id, OR\n"
-            "- ask for the address of a provider from the list.\n"
-            "Return ONLY the title text."
+            "You are a CSR assistant. Member identifiers are missing. "
+            "Return a short message asking the user to restart the conversation. Return ONLY the text."
         )
-        user = "Generate the prompt title for selecting an NPI or requesting address."
-        followup_title = call_horizon(sys, user).strip()
+        msg = call_horizon(sys, "Generate the message.").strip()
         mark_llm(state)
 
-        state["prompt_title"] = followup_title
-        state["prompts"] = []   # free text
+        state["ai_response"] = msg
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    # Call your existing provider-by-id API using NPI as id param
+    try:
+        mark_api(state, provider_search_by_id)
+        providers = provider_search_by_id(
+            id=pid,
+            group_id=group_id,
+            subscriber_id=subscriber_id,
+            asOfDate=state.get("asOfDate", ""),
+        )
+    except Exception as ex:
+        logger.exception("Specialist provider_search_by_id failed: %s", ex)
+        sys = (
+            "You are a CSR assistant. The system could not fetch provider results right now. "
+            "Return a short apology + retry suggestion. Return ONLY the text."
+        )
+        msg = call_horizon(sys, str(ex)).strip()
+        mark_llm(state)
+
+        state["ai_response"] = msg
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    # If still empty, optionally keep NPI loop (Horizon text)
+    if not providers:
+        sys = (
+            "You are a CSR assistant. The selected NPI did not return any provider record in the internal directory. "
+            "Ask the user to try another NPI from the list or search again. Return ONLY the text."
+        )
+        msg = call_horizon(sys, pid).strip()
+        mark_llm(state)
+
+        state["ai_response"] = msg
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 101
+        state["prompt_title"] = ""
+        state["prompts"] = []
         state["stage"] = "NPI_SHOW_RESULTS"
 
-        requested = interrupt({
-            "prompt": state["ai_response"],         # JSON results shown in AIResponse
-            "stage": state["stage"],
-            "prompt_title": state["prompt_title"],  # Horizon title
-            "prompts": state["prompts"],
-            "ai_response_code": state["ai_response_code"],
-            "ai_response_type": state["ai_response_type"],
-            "menu_after": False,                    # IMPORTANT
-        })
-
-        # user will type NPI / address request next
+        requested = interrupt({"prompt": msg, "stage": state["stage"]})
         state["csr_query"] = str(requested).strip()
         return state
 
-    # origin == "menu" (keep existing behavior)
-    state["prompt_title"] = getattr(settings, "NPI_RESULTS_PROMPT_TITLE", "")
-    state["prompts"] = getattr(settings, "NPI_RESULTS_PROMPTS", [])
-    state["stage"] = "NPI_SHOW_RESULTS"
+    # Build SAME grid JSON as your other provider grids
+    grid_list: List[Dict[str, Any]] = []
+    for p in providers:
+        prov_id = (
+            p.get("providerId")
+            or p.get("provId")
+            or p.get("ProviderID")
+            or ""
+        )
+        name_val = (
+            p.get("name")
+            or p.get("providerName")
+            or p.get("fullName")
+            or ""
+        )
+        addr = _format_address_from_provider(p)
 
-    requested = interrupt({
-        "prompt": state["ai_response"],
-        "stage": state["stage"],
-        "prompt_title": state["prompt_title"],
-        "prompts": state["prompts"],
-        "ai_response_code": state["ai_response_code"],
-        "ai_response_type": state["ai_response_type"],
-        "menu_after": True,                         # IMPORTANT
-    })
+        raw_network = p.get("networkStatus") or p.get("network") or ""
+        raw_up = str(raw_network).upper()
+        if raw_up in ("IN", "IN NETWORK"):
+            net_str = "In Network"
+        elif raw_up in ("OUT", "OUT NETWORK"):
+            net_str = "Out Network"
+        else:
+            net_str = str(raw_network) if raw_network else ""
 
+        grid_list.append({
+            "ProviderID": str(prov_id),
+            "Name": str(name_val),
+            "Address": addr,
+            "Network": net_str,
+            "IsAcceptingNewMembers": p.get("isAcceptingNewMembers"),
+            "PCPAssnInd": p.get("pcpAssnInd") or p.get("PCPAssnInd"),
+            "DistanceInMiles": p.get("distance_mi") or p.get("distanceInMiles"),
+        })
+
+    state["providers_result"] = providers
+    state["ai_response"] = json.dumps({"providers": grid_list}, default=str, separators=(",", ":"))
+    state["ai_response_type"] = "AURA"
+    state["ai_response_code"] = 107
+    state["prompt_title"] = ""
+    state["prompts"] = []
+    state["stage"] = "SHOW_SPECIALIST_PROVIDER_LIST"
+
+    requested = interrupt({"prompt": state["ai_response"], "stage": state["stage"]})
     state["csr_query"] = str(requested).strip()
     return state
 
-===========================================================================================================
 
-def node_npi_followup_action(state: PCPState) -> PCPState:
-    """
-    After NPI results in fallback mode:
-    - user provides an NPI number OR asks address
-    - if NPI number -> call provider_search_by_id(id=<NPI>) via existing provider search flow
-    - if address -> return address JSON for that selected NPI record (from NPI results payload)
-    """
-    logger.debug("node_npi_followup_action")
-
-    results = (state.get("npi_results_payload") or {}).get("providers") or []
-    user_msg = (state.get("csr_query") or "").strip()
-
-    if not user_msg:
-        # keep waiting if somehow empty
-        requested = interrupt({
-            "prompt": state.get("ai_response", ""),
-            "stage": "NPI_SHOW_RESULTS",
-            "prompt_title": state.get("prompt_title", ""),
-            "prompts": [],
-        })
-        state["csr_query"] = str(requested).strip()
-        return state
-
-    # Ask Horizon to classify the user's intent and extract NPI if present.
-    sys = (
-        "You interpret a user response after seeing NPI registry results.\n"
-        "Return ONLY valid JSON:\n"
-        "{\n"
-        '  "action": "select_npi" | "address" | "other",\n'
-        '  "npi": string | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If the message contains an NPI number (10 digits), action=select_npi and set npi.\n"
-        "- If the user asks for address/location, action=address and set npi if present.\n"
-        "- Otherwise action=other.\n"
-    )
-    raw = call_horizon(sys, user_msg).strip()
-    mark_llm(state)
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        i = raw.find("{")
-        if i != -1:
-            raw = raw[i:]
-
-    action = "other"
-    npi = None
-    try:
-        parsed = json.loads(raw)
-        action = (parsed.get("action") or "other").strip()
-        npi = parsed.get("npi")
-    except Exception:
-        action = "other"
-        npi = None
-
-    # normalize npi string
-    npi_str = str(npi).strip() if npi else ""
-
-    if action == "address":
-        # Find matching provider in the NPI providers list
-        chosen = None
-        for p in results:
-            if isinstance(p, dict) and str(p.get("NPI") or "").strip() == npi_str:
-                chosen = p
-                break
-
-        if not chosen:
-            # Horizon clarification (no hardcode)
-            sys2 = (
-                "You are a CSR assistant. Ask the user to provide an NPI number from the shown list "
-                "so you can return the address details. Return ONLY the question text."
-            )
-            msg = call_horizon(sys2, user_msg).strip()
-            mark_llm(state)
-            state["ai_response"] = msg
-            state["ai_response_type"] = "AURA"
-            state["ai_response_code"] = 101
-            state["prompt_title"] = ""
-            state["prompts"] = []
-            state["stage"] = "NPI_SHOW_RESULTS"
-            requested = interrupt({"prompt": msg, "stage": state["stage"]})
-            state["csr_query"] = str(requested).strip()
-            return state
-
-        addr_payload = {
-            "providerAddress": [{
-                "NPI": chosen.get("NPI", ""),
-                "Name": chosen.get("Name", ""),
-                "Address": chosen.get("Address", ""),
-                "Phone": chosen.get("Phone", ""),
-            }]
-        }
-
-        state["ai_response"] = json.dumps(addr_payload, default=str, separators=(",", ":"))
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 110
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "NPI_ADDRESS_RESULT"
-
-        requested = interrupt({"prompt": state["ai_response"], "stage": state["stage"]})
-        state["csr_query"] = str(requested).strip()
-        return state
+=======================================================================================
 
     if action == "select_npi" and npi_str:
-        # Route into your existing provider-id flow, but pass NPI as the "id"
         state["provider_id_override"] = npi_str
 
-        # Clear any previous provider results so node_run_provider_search runs
+        # Clear any previous provider results so next search runs
         state["providers_result"] = None
 
-        # Reuse your YES-flow mechanics
-        state["knows_provider"] = True
-        state["raw_provider_input"] = npi_str
+        # Decide target flow
+        tgt = (state.get("npi_target_flow") or "pcp").strip().lower()
+        state["stage"] = "NPI_SELECTED"
 
-        # IMPORTANT: stop NPI loop state so it doesn't repeat results
+        # Stop NPI loop state so it doesn't replay
         state.pop("npi_results_payload", None)
         state.pop("npi_mode", None)
         state.pop("npi_query", None)
-        state.pop("npi_followup_text", None)
 
+        # If specialist fallback, we do NOT set knows_provider/raw_provider_input for PCP flow
+        # We will route to specialist-id-search node
+        if tgt == "specialist":
+            return state
+
+        # PCP flow default (existing behavior)
+        state["knows_provider"] = True
+        state["raw_provider_input"] = npi_str
         return state
 
-    # Otherwise ask again (Horizon)
-    sys3 = (
-        "You are a CSR assistant. The user must either:\n"
-        "- enter an NPI number from the shown list to search provider by id, OR\n"
-        "- ask for the address of a provider using its NPI.\n"
-        "Return ONLY the instruction text."
-    )
-    msg = call_horizon(sys3, user_msg).strip()
-    mark_llm(state)
 
-    state["ai_response"] = msg
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 101
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["stage"] = "NPI_SHOW_RESULTS"
+===================================================================================
 
-    requested = interrupt({"prompt": msg, "stage": state["stage"]})
-    state["csr_query"] = str(requested).strip()
-    return state
-
-================================================================================================
-
-    override_id = (state.get("provider_id_override") or "").strip()
-    if override_id:
-        # Treat override as provider-id search
-        parsed = {"search_type": "id", "provider_id": override_id}
-    else:
-        parsed = llm_parse_provider_input(state.get("raw_provider_input") or "")
+builder.add_node("run_specialist_id_search", node_run_specialist_id_search)
 
 
-    pid = parsed.get("provider_id") or ""
-    state["provider_id"] = pid
-    # clear override once consumed
-    state["provider_id_override"] = None
+def route_after_npi_followup(state: PCPState) -> str:
+    tgt = (state.get("npi_target_flow") or "pcp").strip().lower()
+    # if we have an override id, proceed; otherwise keep looping in npi followup
+    if not (state.get("provider_id_override") or ""):
+        return "loop"
+    return "specialist" if tgt == "specialist" else "pcp"
 
-==========================================================================================
 
-builder.add_node("npi_followup_action", node_npi_followup_action)
-
-from app.graph.routing import route_after_npi_run_search
+from app.graph.routing import route_after_npi_followup
 
 builder.add_conditional_edges(
-    "npi_run_search",
-    path=route_after_npi_run_search,
+    "npi_followup_action",
+    path=route_after_npi_followup,
     path_map={
-        "followup": "npi_followup_action",   # fallback mode -> user selects NPI/address
-        "menu": "return_to_menu",            # menu mode -> your existing START menu behavior
+        "pcp": "run_provider_search",
+        "specialist": "run_specialist_id_search",
+        "loop": "npi_followup_action",
     },
 )
 
-# After fallback followup selection:
-# - If they selected NPI, node sets provider_id_override and knows_provider/raw_provider_input,
-#   so we can route directly into provider search.
-builder.add_edge("npi_followup_action", "run_provider_search")
 
-====================================================================================================
+builder.add_edge("run_specialist_id_search", "specialist_provider_address")
 
-            elif stage_from_node == "NPI_SHOW_RESULTS":
-                ai_resp_text = prompt or last_state.get("ai_response", "")
-                menu_after = bool(interrupt_payload.get("menu_after", True))
 
-                if menu_after:
-                    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "How can I assist you today?"
-                    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or settings.DEFAULT_PROMPTS
-                    response_payload = base_response(
-                        thread_id=req.thread_id,
-                        stage="START",
-                        ai_response=ai_resp_text,
-                        csr_query=req.message or "",
-                        prompts=pr,
-                        prompt_title=ptitle,
-                        ai_response_code=107,
-                        ai_response_type="AURA",
-                        call_source=call_source,
-                    )
-                else:
-                    # fallback mode: stay in NPI_SHOW_RESULTS so next user message is treated as selection
-                    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
-                    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or []
-                    response_payload = base_response(
-                        thread_id=req.thread_id,
-                        stage="NPI_SHOW_RESULTS",
-                        ai_response=ai_resp_text,
-                        csr_query=req.message or "",
-                        prompts=pr,
-                        prompt_title=ptitle,
-                        ai_response_code=107,
-                        ai_response_type="AURA",
-                        call_source=call_source,
-                    )
-                break
+================================================
 
-========================================================================================================================
