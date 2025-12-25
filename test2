@@ -1,77 +1,88 @@
-import requests
-import pandas as pd  # optional (you can avoid pandas if you want)
-import json
-
 def node_npi_run_search(state: PCPState) -> PCPState:
     """
-    Executes NPI Registry search based on state["npi_mode"] and state["npi_query"].
-    MUST interrupt with results so the graph does not continue to START in same turn.
+    NPI Web flow:
+      - Reads state["npi_mode"] = "zip" | "name"
+      - Reads state["npi_query"] (zip or name text)
+      - Calls NPI registry service (API)
+      - Returns JSON results in state["ai_response"]
+      - Interrupts with stage "NPI_SHOW_RESULTS" so /chat can return AIResponse JSON
     """
-    # If already have results, don't re-run
-    if state.get("npi_results_json"):
+
+    logger.debug("node_npi_run_search")
+
+    # If already have results, don't re-run (resume safety)
+    if state.get("npi_results_payload"):
+        state["ai_response"] = json.dumps(state["npi_results_payload"], default=str, separators=(",", ":"))
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 107
+        state["prompt_title"] = getattr(settings, "NPI_RESULTS_PROMPT_TITLE", "")
+        state["prompts"] = getattr(settings, "NPI_RESULTS_PROMPTS", [])
+        state["stage"] = "NPI_SHOW_RESULTS"
+
+        requested = interrupt({
+            "prompt": state["ai_response"],
+            "stage": state["stage"],
+            "prompt_title": state["prompt_title"],
+            "prompts": state["prompts"],
+        })
+        state["csr_query"] = str(requested).strip()
         return state
 
-    mode = state.get("npi_mode")
+    mode = (state.get("npi_mode") or "").strip().lower()
     query = (state.get("npi_query") or "").strip()
-    if not mode or not query:
-        state["ai_response"] = "Missing NPI search input. Please try again."
+
+    # Safety: if missing inputs, don’t break flow; just ask again via interrupt
+    if mode not in ("zip", "name"):
+        # Let existing node_npi_ask_mode handle, but avoid breaking:
+        state["ai_response"] = ""
         state["ai_response_type"] = "AURA"
         state["ai_response_code"] = 101
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "ERROR"
+        state["prompt_title"] = getattr(settings, "NPI_MODE_PROMPT_TITLE", "Choose search type")
+        state["prompts"] = getattr(settings, "NPI_MODE_PROMPTS", ["Zip Code", "Name"])
+        state["stage"] = "NPI_ASK_MODE"
+
+        requested = interrupt({
+            "prompt": "",
+            "stage": state["stage"],
+            "prompt_title": state["prompt_title"],
+            "prompts": state["prompts"],
+        })
+        state["csr_query"] = str(requested).strip()
         return state
 
-    url = "https://npiregistry.cms.hhs.gov/api/"
-    params = {"version": "2.1", "limit": 200}
+    if not query:
+        # Let existing node_npi_ask_query handle, but avoid breaking:
+        state["ai_response"] = ""
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 101
+        state["prompt_title"] = getattr(settings, "NPI_QUERY_PROMPT_TITLE", "Enter search value")
+        state["prompts"] = getattr(settings, "NPI_QUERY_PROMPTS", [])
+        state["stage"] = "NPI_ASK_QUERY"
 
-    # ✅ Deterministic param selection
-    if mode == "zip":
-        clean_zip = query.replace("-", "").strip()[:5]
-        params["postal_code"] = clean_zip
-    else:
-        # name mode:
-        # simplest: send as last_name or first_name? your streamlit tried both.
-        # We'll do both calls and merge like your streamlit logic.
-        pass
+        requested = interrupt({
+            "prompt": "",
+            "stage": state["stage"],
+            "prompt_title": state["prompt_title"],
+            "prompts": state["prompts"],
+        })
+        state["csr_query"] = str(requested).strip()
+        return state
 
-    results = []
-
+    # ------------------ Perform API search ------------------
+    results: List[Dict[str, Any]] = []
     try:
         if mode == "zip":
-            resp = requests.get(url, params=params, timeout=20)
-            resp.raise_for_status()
-            payload = resp.json()
-            results = payload.get("results", []) or []
-
+            mark_api(state, npi_search_by_zip)
+            results = npi_search_by_zip(query)
         else:
-            name = query
-            # Try first_name
-            p1 = dict(params)
-            p1["first_name"] = name
-            r1 = requests.get(url, params=p1, timeout=20)
-            r1.raise_for_status()
-            res1 = (r1.json().get("results", []) or [])
-
-            # Try last_name
-            p2 = dict(params)
-            p2["last_name"] = name
-            r2 = requests.get(url, params=p2, timeout=20)
-            r2.raise_for_status()
-            res2 = (r2.json().get("results", []) or [])
-
-            # Merge unique by NPI number
-            seen = set()
-            merged = []
-            for item in (res1 + res2):
-                npi = item.get("number")
-                if npi and npi not in seen:
-                    seen.add(npi)
-                    merged.append(item)
-            results = merged
+            mark_api(state, npi_search_by_name)
+            results = npi_search_by_name(query)
 
     except Exception as ex:
-        state["ai_response"] = f"Failed to call NPI Registry: {ex}"
+        logger.exception("NPI search failed: %s", ex)
+        # Keep flow alive but return an error response (no hardcoded text if you have a setting)
+        err_msg = getattr(settings, "NPI_ERROR_MESSAGE", "Unable to fetch NPI results right now. Please try again.")
+        state["ai_response"] = err_msg
         state["ai_response_type"] = "AURA"
         state["ai_response_code"] = 500
         state["prompt_title"] = ""
@@ -79,84 +90,37 @@ def node_npi_run_search(state: PCPState) -> PCPState:
         state["stage"] = "ERROR"
         return state
 
-    # Convert to your table-style JSON (same as Streamlit dataframe)
-    table_data = []
-    for person in results:
-        basic = person.get("basic", {}) or {}
-        first = basic.get("first_name", "") or ""
-        last = basic.get("last_name", "") or ""
-        full_name = (first + " " + last).strip()
+    # ------------------ Build JSON payload ------------------
+    # Keep the payload shape consistent for your UI
+    payload: Dict[str, Any] = {
+        "npiSearch": {
+            "mode": mode,
+            "query": query,
+            "count": len(results),
+            "providers": results,
+        }
+    }
 
-        npi = person.get("number", "") or ""
+    state["npi_results_payload"] = payload
 
-        addresses = person.get("addresses", []) or []
-        practice_addr = next((a for a in addresses if a.get("address_purpose") == "LOCATION"), {}) or {}
-        address = f'{practice_addr.get("address_1", "")}, {practice_addr.get("city", "")}, {practice_addr.get("state", "")}'.strip(", ")
-
-        phone = practice_addr.get("telephone_number", "") or ""
-
-        taxonomy = ""
-        taxonomies = person.get("taxonomies", []) or []
-        if taxonomies:
-            taxonomy = (taxonomies[0].get("desc") or "")
-
-        table_data.append({
-            "Name": full_name,
-            "NPI": str(npi),
-            "Specialty": taxonomy,
-            "Address": address,
-            "Phone": phone
-        })
-
-    response_payload = {"providers": table_data}
-    state["npi_results_json"] = json.dumps(response_payload, separators=(",", ":"), default=str)
-
-    # ✅ IMPORTANT: interrupt right here with results + menu prompts
-    state["ai_response"] = state["npi_results_json"]
+    # Contract: AIResponse holds JSON
+    state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
     state["ai_response_type"] = "AURA"
     state["ai_response_code"] = 107
-    state["prompt_title"] = "How can I assist you today?"
-    state["prompts"] = ["Assign PCP", "Search for specialist", "Search Provider NPI (Web)"]
+    state["prompt_title"] = getattr(settings, "NPI_RESULTS_PROMPT_TITLE", "")
+    state["prompts"] = getattr(settings, "NPI_RESULTS_PROMPTS", [])
     state["stage"] = "NPI_SHOW_RESULTS"
 
+    # Interrupt so /chat returns the results immediately
     requested = interrupt({
-        "prompt": state["ai_response"],  # JSON goes to AIResponse
+        "prompt": state["ai_response"],
         "stage": state["stage"],
         "prompt_title": state["prompt_title"],
         "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
     })
 
-    # Next selection captured here for routing
-    state["csr_query"] = str(requested).strip().lower()
-
-    # Clear NPI-specific fields so next time NPI can run again cleanly
-    state["npi_mode"] = None
-    state["npi_query"] = None
-    state["npi_results_json"] = None
-
+    # Store next user message (graph edges can route to menu afterward)
+    state["csr_query"] = str(requested).strip()
     return state
-
-
-====================================
-
-elif stage_from_node == "NPI_SHOW_RESULTS":
-    ai_resp_text = prompt or last_state.get("ai_response", "")
-    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "How can I assist you today?"
-    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or ["Assign PCP","Search for specialist","Search Provider NPI (Web)"]
-
-    response_payload = base_response(
-        thread_id=req.thread_id,
-        stage="START",               # you want menu again
-        ai_response=ai_resp_text,    # JSON results
-        csr_query=req.message or "",
-        prompts=pr,
-        prompt_title=ptitle,
-        ai_response_code=107,
-        ai_response_type="AURA",
-        call_source=call_source,
-    )
-    break
-
-
-============================
-
