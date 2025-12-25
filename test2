@@ -1,20 +1,90 @@
+import json
+import logging
+from typing import Any, Dict, List
+
+from langgraph.types import interrupt
+
+from app.config import settings
+from app.graph.state import PCPState
+from app.graph.call_source import mark_api
+from app.services.npi_registry import npi_search_by_zip, npi_search_by_name
+
+logger = logging.getLogger("pcp_app")
+
+
+def _npi_simplify_provider(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert raw NPI registry provider payload to ONLY:
+      Name, NPI, Specialty, Address, Phone
+    No hardcoded prompts; just field mapping.
+    """
+    # Name
+    basic = raw.get("basic") or {}
+    enum_type = (raw.get("enumeration_type") or "").strip().upper()
+
+    if enum_type == "NPI-2":
+        name = basic.get("organization_name") or ""
+    else:
+        first = basic.get("first_name") or ""
+        last = basic.get("last_name") or ""
+        name = (f"{first} {last}").strip()
+
+    # NPI number
+    npi = raw.get("number") or ""
+
+    # Specialty (taxonomy desc)
+    specialty = ""
+    taxonomies = raw.get("taxonomies") or []
+    if isinstance(taxonomies, list) and taxonomies:
+        t0 = taxonomies[0] or {}
+        specialty = t0.get("desc") or ""
+
+    # Address + Phone from LOCATION
+    address = ""
+    phone = ""
+    addresses = raw.get("addresses") or []
+    if isinstance(addresses, list) and addresses:
+        loc = None
+        for a in addresses:
+            if isinstance(a, dict) and (a.get("address_purpose") == "LOCATION"):
+                loc = a
+                break
+        if loc is None:
+            loc = addresses[0] if isinstance(addresses[0], dict) else {}
+
+        a1 = loc.get("address_1") or ""
+        city = loc.get("city") or ""
+        st = loc.get("state") or ""
+        address = ", ".join([p for p in [a1, city, st] if p])
+        phone = loc.get("telephone_number") or ""
+
+    return {
+        "Name": name,
+        "NPI": str(npi),
+        "Specialty": specialty,
+        "Address": address,
+        "Phone": phone,
+    }
+
+
 def node_npi_run_search(state: PCPState) -> PCPState:
     """
     NPI Web flow:
-      - Reads state["npi_mode"] = "zip" | "name"
-      - Reads state["npi_query"] (zip or name text)
-      - Calls NPI registry service (API)
-      - Returns JSON results in state["ai_response"]
-      - Interrupts with stage "NPI_SHOW_RESULTS" so /chat can return AIResponse JSON
+      - mode in state["npi_mode"] = "zip" | "name"
+      - query in state["npi_query"]
+      - Calls NPI registry service
+      - Responds with JSON in AIResponse (ONLY Name/NPI/Specialty/Address/Phone)
+      - Interrupts with stage "NPI_SHOW_RESULTS"
     """
-
     logger.debug("node_npi_run_search")
 
-    # If already have results, don't re-run (resume safety)
+    # If already have results cached, ONLY reuse if you're still in NPI_SHOW_RESULTS stage.
+    # (When you return to menu, node_return_to_menu clears these keys.)
     if state.get("npi_results_payload"):
-        state["ai_response"] = json.dumps(state["npi_results_payload"], default=str, separators=(",", ":"))
+        payload = state["npi_results_payload"]
+        state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
         state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 107
+        state["ai_response_code"] = getattr(settings, "NPI_RESULTS_CODE", 107)
         state["prompt_title"] = getattr(settings, "NPI_RESULTS_PROMPT_TITLE", "")
         state["prompts"] = getattr(settings, "NPI_RESULTS_PROMPTS", [])
         state["stage"] = "NPI_SHOW_RESULTS"
@@ -24,6 +94,8 @@ def node_npi_run_search(state: PCPState) -> PCPState:
             "stage": state["stage"],
             "prompt_title": state["prompt_title"],
             "prompts": state["prompts"],
+            "ai_response_code": state["ai_response_code"],
+            "ai_response_type": state["ai_response_type"],
         })
         state["csr_query"] = str(requested).strip()
         return state
@@ -31,13 +103,12 @@ def node_npi_run_search(state: PCPState) -> PCPState:
     mode = (state.get("npi_mode") or "").strip().lower()
     query = (state.get("npi_query") or "").strip()
 
-    # Safety: if missing inputs, don’t break flow; just ask again via interrupt
+    # Safety: if missing mode/query, bounce to your earlier nodes via interrupt (no breaking)
     if mode not in ("zip", "name"):
-        # Let existing node_npi_ask_mode handle, but avoid breaking:
         state["ai_response"] = ""
         state["ai_response_type"] = "AURA"
         state["ai_response_code"] = 101
-        state["prompt_title"] = getattr(settings, "NPI_MODE_PROMPT_TITLE", "Choose search type")
+        state["prompt_title"] = getattr(settings, "NPI_MODE_PROMPT_TITLE", "")
         state["prompts"] = getattr(settings, "NPI_MODE_PROMPTS", ["Zip Code", "Name"])
         state["stage"] = "NPI_ASK_MODE"
 
@@ -51,11 +122,10 @@ def node_npi_run_search(state: PCPState) -> PCPState:
         return state
 
     if not query:
-        # Let existing node_npi_ask_query handle, but avoid breaking:
         state["ai_response"] = ""
         state["ai_response_type"] = "AURA"
         state["ai_response_code"] = 101
-        state["prompt_title"] = getattr(settings, "NPI_QUERY_PROMPT_TITLE", "Enter search value")
+        state["prompt_title"] = getattr(settings, "NPI_QUERY_PROMPT_TITLE", "")
         state["prompts"] = getattr(settings, "NPI_QUERY_PROMPTS", [])
         state["stage"] = "NPI_ASK_QUERY"
 
@@ -68,19 +138,22 @@ def node_npi_run_search(state: PCPState) -> PCPState:
         state["csr_query"] = str(requested).strip()
         return state
 
-    # ------------------ Perform API search ------------------
-    results: List[Dict[str, Any]] = []
+    # -------- Call services --------
     try:
+        raw_results: List[Dict[str, Any]] = []
+
         if mode == "zip":
             mark_api(state, npi_search_by_zip)
-            results = npi_search_by_zip(query)
+            raw_results = npi_search_by_zip(query)
         else:
             mark_api(state, npi_search_by_name)
-            results = npi_search_by_name(query)
+            raw_results = npi_search_by_name(query)
+
+        # Normalize to 5 fields only
+        providers = [_npi_simplify_provider(p) for p in (raw_results or []) if isinstance(p, dict)]
 
     except Exception as ex:
         logger.exception("NPI search failed: %s", ex)
-        # Keep flow alive but return an error response (no hardcoded text if you have a setting)
         err_msg = getattr(settings, "NPI_ERROR_MESSAGE", "Unable to fetch NPI results right now. Please try again.")
         state["ai_response"] = err_msg
         state["ai_response_type"] = "AURA"
@@ -90,28 +163,24 @@ def node_npi_run_search(state: PCPState) -> PCPState:
         state["stage"] = "ERROR"
         return state
 
-    # ------------------ Build JSON payload ------------------
-    # Keep the payload shape consistent for your UI
+    # Payload (no raw provider dump)
     payload: Dict[str, Any] = {
         "npiSearch": {
             "mode": mode,
             "query": query,
-            "count": len(results),
-            "providers": results,
+            "count": len(providers),
+            "providers": providers,
         }
     }
 
     state["npi_results_payload"] = payload
-
-    # Contract: AIResponse holds JSON
     state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
     state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 107
+    state["ai_response_code"] = getattr(settings, "NPI_RESULTS_CODE", 107)
     state["prompt_title"] = getattr(settings, "NPI_RESULTS_PROMPT_TITLE", "")
     state["prompts"] = getattr(settings, "NPI_RESULTS_PROMPTS", [])
     state["stage"] = "NPI_SHOW_RESULTS"
 
-    # Interrupt so /chat returns the results immediately
     requested = interrupt({
         "prompt": state["ai_response"],
         "stage": state["stage"],
@@ -121,6 +190,5 @@ def node_npi_run_search(state: PCPState) -> PCPState:
         "ai_response_type": state["ai_response_type"],
     })
 
-    # Store next user message (graph edges can route to menu afterward)
     state["csr_query"] = str(requested).strip()
     return state
