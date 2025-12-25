@@ -1,7 +1,244 @@
-    # ---- Fast deterministic shortcuts (avoid LLM for obvious menu clicks) ----
-    if ("assign" in text and "pcp" in text) or text in ("1", "option 1"):
-        return "assign_pcp"
-    if ("specialist" in text) or text in ("2", "option 2"):
-        return "specialist"
-    if ("npi" in text) or ("provider npi" in text) or ("search provider npi" in text) or text in ("3", "option 3"):
-        return "npi"
+import requests
+from typing import Any, Dict, List
+
+NPI_URL = "https://npiregistry.cms.hhs.gov/api/"
+
+def npi_search_by_zip(zip_code: str, limit: int = 200) -> List[Dict[str, Any]]:
+    clean_zip = (zip_code or "").strip().replace("-", "")[:5]
+    params = {"version": "2.1", "postal_code": clean_zip, "limit": limit}
+    data = requests.get(NPI_URL, params=params, timeout=30).json()
+    return data.get("results", []) or []
+
+def npi_search_by_name(name: str, limit: int = 200) -> List[Dict[str, Any]]:
+    # Use the same logic you had in Streamlit (first/last, combinations)
+    name_parts = (name or "").strip().split()
+    results: List[Dict[str, Any]] = []
+
+    def _call(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        params = {"version": "2.1", "limit": limit, **params}
+        data = requests.get(NPI_URL, params=params, timeout=30).json()
+        return data.get("results", []) or []
+
+    if len(name_parts) == 1:
+        first_results = _call({"first_name": name_parts[0]})
+        last_results  = _call({"last_name": name_parts[0]})
+        seen = set()
+        for r in first_results + last_results:
+            npi = r.get("number")
+            if npi and npi not in seen:
+                seen.add(npi)
+                results.append(r)
+    else:
+        clean_parts = [p.rstrip(".") for p in name_parts if len(p.rstrip(".")) > 1]
+        if len(clean_parts) >= 2:
+            seen = set()
+            # Last First
+            for r in _call({"last_name": clean_parts[0], "first_name": clean_parts[1]}):
+                npi = r.get("number")
+                if npi and npi not in seen:
+                    seen.add(npi)
+                    results.append(r)
+            # First Last
+            for r in _call({"first_name": clean_parts[0], "last_name": clean_parts[1]}):
+                npi = r.get("number")
+                if npi and npi not in seen:
+                    seen.add(npi)
+                    results.append(r)
+        else:
+            single = clean_parts[0] if clean_parts else name_parts[0]
+            first_results = _call({"first_name": single})
+            last_results  = _call({"last_name": single})
+            seen = set()
+            for r in first_results + last_results:
+                npi = r.get("number")
+                if npi and npi not in seen:
+                    seen.add(npi)
+                    results.append(r)
+
+    return results
+
+def normalize_npi_results(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    table = []
+    for person in raw_results or []:
+        basic = person.get("basic", {}) or {}
+        first = basic.get("first_name", "") or ""
+        last = basic.get("last_name", "") or ""
+        full_name = (first + " " + last).strip()
+
+        npi = person.get("number", "")
+
+        addresses = person.get("addresses", []) or []
+        practice = next((a for a in addresses if a.get("address_purpose") == "LOCATION"), {}) or {}
+        address = f"{practice.get('address_1','')}, {practice.get('city','')}, {practice.get('state','')}".strip(", ").strip()
+        phone = practice.get("telephone_number", "") or ""
+
+        taxonomy = ""
+        tax = person.get("taxonomies", []) or []
+        if tax:
+            taxonomy = (tax[0] or {}).get("desc", "") or ""
+
+        table.append({
+            "Name": full_name,
+            "NPI": str(npi),
+            "Specialty": taxonomy,
+            "Address": address,
+            "Phone": phone,
+        })
+
+    return {"providers": table}
+
+
+================================================================
+
+def node_npi_ask_mode(state: PCPState) -> PCPState:
+    """
+    Ask user to choose Zip Code or Name.
+    """
+    state["flow"] = "npi"
+
+    # If already chosen, skip
+    if state.get("npi_mode"):
+        return state
+
+    system = (
+        "You are a CSR assistant. Ask the member to choose how to search the NPI Registry. "
+        "Return ONLY a short question text."
+    )
+    prompt = "Would you like to search by Zip Code or by Provider Name?"
+    ai_msg = call_horizon(system, prompt).strip()
+    mark_llm(state)
+
+    state["ai_response"] = ""
+    state["ai_response_type"] = "AURA"
+    state["ai_response_code"] = 101
+    state["prompt_title"] = ai_msg
+    state["prompts"] = ["Zip Code", "Name"]
+    state["stage"] = "NPI_ASK_MODE"
+
+    requested = interrupt({
+        "prompt": "",
+        "stage": state["stage"],
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+
+    choice = str(requested).strip().lower()
+    # deterministic mapping
+    if "zip" in choice:
+        state["npi_mode"] = "zip"
+    elif "name" in choice:
+        state["npi_mode"] = "name"
+    else:
+        # fallback: keep asking
+        state["npi_mode"] = None
+
+    state["csr_query"] = ""  # keep clean
+    return state
+
+
+=============================
+
+def node_npi_collect_query(state: PCPState) -> PCPState:
+    """
+    Based on npi_mode, ask for the actual zip or name.
+    """
+    mode = state.get("npi_mode")
+
+    if not mode:
+        return state  # will route back to ask_mode
+
+    if state.get("npi_query"):
+        return state
+
+    if mode == "zip":
+        question = "Please enter the 5-digit Zip Code to search the NPI registry."
+    else:
+        question = "Please enter the provider's name to search the NPI registry."
+
+    # (Optional) Horizon rephrase - but enforce meaning
+    ai_msg = call_horizon("You are a CSR assistant. Return the question as-is.", question).strip()
+    mark_llm(state)
+    if mode == "zip" and "zip" not in ai_msg.lower():
+        ai_msg = question
+    if mode == "name" and "name" not in ai_msg.lower():
+        ai_msg = question
+
+    state["ai_response"] = ai_msg
+    state["ai_response_type"] = "Dialog"
+    state["ai_response_code"] = 103
+    state["prompt_title"] = ""
+    state["prompts"] = []
+    state["stage"] = "NPI_ASK_QUERY"
+
+    requested = interrupt({"prompt": ai_msg, "stage": state["stage"]})
+    state["npi_query"] = str(requested).strip()
+    return state
+
+
+===============================
+
+def node_npi_search(state: PCPState) -> PCPState:
+    mode = state.get("npi_mode")
+    query = (state.get("npi_query") or "").strip()
+
+    if not mode or not query:
+        return state
+
+    try:
+        if mode == "zip":
+            # validate zip: must contain 5 digits at least
+            digits = "".join([c for c in query if c.isdigit()])
+            zip5 = digits[:5]
+            if len(zip5) != 5:
+                state["ai_response"] = "Please enter a valid 5-digit Zip Code."
+                state["ai_response_type"] = "AURA"
+                state["ai_response_code"] = 101
+                state["prompt_title"] = ""
+                state["prompts"] = []
+                state["stage"] = "NPI_BAD_ZIP"
+                return state
+
+            mark_api(state, npi_search_by_zip)
+            raw = npi_search_by_zip(zip5)
+        else:
+            mark_api(state, npi_search_by_name)
+            raw = npi_search_by_name(query)
+
+        payload = normalize_npi_results(raw)
+
+        state["ai_response"] = json.dumps(payload, default=str, separators=(",", ":"))
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 110
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "NPI_RESULTS"
+
+        # After showing results, immediately show menu again
+        requested = interrupt({
+            "prompt": state["ai_response"],
+            "stage": state["stage"],
+        })
+
+        # reset npi fields for next time
+        state["npi_mode"] = None
+        state["npi_query"] = None
+
+        # capture next selection and route via return_to_menu logic
+        state["csr_query"] = str(requested).strip()
+        state["stage"] = "GO_MENU"
+        return state
+
+    except Exception as ex:
+        state["ai_response"] = f"NPI registry lookup failed: {ex}"
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+
+========================================
+
