@@ -1,78 +1,38 @@
-class ProviderSearchAPIError(Exception):
-    def __init__(self, message: str, status_code: Optional[int] = None, payload: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
-        self.payload = payload or {}
-
-========================================
-
-def extract_backend_error_detail(payload: Any) -> Optional[str]:
-    """
-    Extracts the most useful 'detail' message from backend error payload.
-    Expected shape (example):
-      {"exceptions":[{"type":"..","message":"..","detail":"..","code":".."}]}
-    Returns detail if found, else None.
-    """
-    if not isinstance(payload, dict):
-        return None
-
-    ex_list = payload.get("exceptions")
-    if isinstance(ex_list, list) and ex_list:
-        ex0 = ex_list[0]
-        if isinstance(ex0, dict):
-            detail = ex0.get("detail")
-            if isinstance(detail, str) and detail.strip():
-                return detail.strip()
-
-            # fallback to message if detail missing (still coming from backend, not hardcoded)
-            msg = ex0.get("message")
-            if isinstance(msg, str) and msg.strip():
-                return msg.strip()
-
-    return None
-
-=====================================================
+requested = interrupt({
+    "stage": state["stage"],
+    "prompt": state["ai_response"],
+    "prompt_title": state["prompt_title"],
+    "prompts": state["prompts"],
+    "ai_response_code": state["ai_response_code"],
+    "ai_response_type": state["ai_response_type"],
+})
+state["csr_query"] = str(requested).strip()
+return state
 
 
-    try:
-        resp = requests.post(url, json=payload, timeout=settings.DEFAULT_TIMEOUT)
-    except requests.RequestException as e:
-        # Network / timeout etc. -> bubble up (message comes from requests)
-        raise ProviderSearchAPIError(str(e), status_code=None, payload=None)
 
-    if resp.status_code >= 400:
-        err_payload: Any = None
-        try:
-            err_payload = resp.json()
-        except Exception:
-            err_payload = {"raw": resp.text}
+===========
 
-        detail = extract_backend_error_detail(err_payload)
-        # No hardcoded user-facing text; use backend-provided detail if available
-        raise ProviderSearchAPIError(
-            message=detail or str(err_payload),
-            status_code=resp.status_code,
-            payload=err_payload if isinstance(err_payload, dict) else {"raw": err_payload},
-        )
+elif stage_from_node == "ERROR":
+    ai_resp_text = prompt or last_state.get("ai_response", "")
+    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
+    pr = interrupt_payload.get("prompts")
+    if pr is None:
+        pr = last_state.get("prompts", [])
+    code = interrupt_payload.get("ai_response_code") or last_state.get("ai_response_code", 500)
+    rtype = interrupt_payload.get("ai_response_type") or last_state.get("ai_response_type", "AURA")
 
-    data = resp.json()
+    response_payload = base_response(
+        thread_id=req.thread_id,
+        stage="ERROR",
+        ai_response=ai_resp_text,
+        csr_query=req.message or "",
+        prompts=pr,
+        prompt_title=ptitle,
+        ai_response_code=code,
+        ai_response_type=rtype,
+        call_source=call_source,
+    )
+    break
 
-========================================================================================
 
-except ProviderSearchAPIError as e:
-    # Show backend detail to user
-    state["providers_result"] = []
-    state["ai_response"] = e.message  # <-- this is backend exceptions[0].detail
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["ai_response_code"] = e.status_code or 500
-    state["ai_response_type"] = "AURA"
-    state["stage"] = "ERROR"
-
-    requested = interrupt({
-        "prompt": state["ai_response"],
-        "stage": state["stage"],
-    })
-    state["csr_query"] = str(requested).strip()
-    return state
