@@ -1,9 +1,94 @@
-except requests.exceptions.ReadTimeout:
-    # Don't break flow: show a recoverable error and wait for next user input
-    state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 500
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["stage"] = "ERROR"
-    return state
+from app.graph.state import PCPState
+from app.llm.parsers import (
+    llm_route_menu_intent,
+    llm_classify_yes_no
+)
+
+def route_from_menu(state: PCPState) -> str:
+    text = (state.get("csr_query") or "").lower().strip()
+
+    if not text:
+        return "unsupported"
+    return llm_route_menu_intent(text)
+
+
+def route_knows_provider(state: PCPState) -> str:
+    if state.get("knows_provider"):
+        return "knows"
+    return "unknown"
+
+def route_after_provider_followup(state: PCPState) -> str:
+    if state.get("last_followup_action") == "assign_pcp":
+        return "assign"
+    if state.get("last_followup_action") == "provider_id_only":
+        return "pid_only"
+    return "loop"
+
+def route_after_specialist_completion(state: PCPState) -> str:
+    st = (state.get("stage") or "").strip()
+    st_up = st.upper()
+
+    if st_up in ("CLOSED","STOP","END","ERROR"):
+        return "end"
+    
+    if st_up in ("GO_MENU","START","MENU","GO_NPI"):
+        return "menu"
+    
+    return "menu"
+
+def route_after_specialist_provider_address(state: PCPState) -> str:
+    # Only go to post-completion logic if we truly completed address inquiry
+    if state.get("stage") == "COMPLETED":
+        return "completed"
+    return "loop"
+
+def route_after_specialist_search(state: PCPState) -> str:
+    # If we set GO_NPI in no-results case, route to NPI flow
+    if (state.get("stage") or "").strip() == "GO_NPI":
+        return "npi"
+    # If providers exist, continue normally
+    if state.get("providers_result"):
+        return "providers"
+    # defensive: treat missing providers as stop (avoid loops)
+    return "stop"
+
+def route_after_provider_search_results(state: PCPState) -> str:
+    """
+    After run_provider_search:
+      - if providers exist -> "found"
+      - if none -> "no_results"
+    """
+    providers = state.get("providers_result") or []
+    if isinstance(providers, list) and len(providers) > 0:
+        return "found"
+    return "no_results"
+
+
+def route_after_no_results_offer(state: PCPState) -> str:
+    """
+    After we ask: "Do you want NPI web search?"
+    Use Horizon to classify yes/no (no hardcoded match).
+    """
+    txt = (state.get("csr_query") or "").strip()
+    ans = llm_classify_yes_no(txt)
+    if ans == "yes":
+        return "npi"
+    if ans == "no":
+        return "menu"
+    # unknown -> re-ask offer (safe)
+    return "loop"
+
+def route_after_npi_run_search(state: PCPState) -> str:
+    """
+    If NPI was entered from menu -> keep current behavior (results + menu).
+    If NPI was entered from fallback -> go to followup node (user selects NPI/address).
+    """
+    origin = (state.get("npi_origin") or "menu").strip().lower()
+    return "followup" if origin == "fallback" else "menu"
+
+def route_after_npi_followup(state: PCPState) -> str:
+    tgt = (state.get("npi_target_flow") or "pcp").strip().lower()
+    # if we have an override id, proceed; otherwise keep looping in npi followup
+    if not (state.get("provider_id_override") or ""):
+        return "loop"
+    return "specialist" if tgt == "specialist" else "pcp"
