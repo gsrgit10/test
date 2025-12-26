@@ -1,26 +1,165 @@
-# ✅ NEW: Clear Assign-PCP flow state so re-selecting "Assign PCP" starts from termination reason again
-    # (Keep thread_id/member_id/interaction_id/case_* intact)
-    for k in (
-        "termination_reason",
-        "knows_provider",
-        "raw_provider_input",
-        "raw_filter_input",
-        "providers_result",
-        "last_followup_action",
-        "provider_id",
-        "provider_name",
-        "provider_city",
-        "provider_state",
-        "startingLocationZip",
-        "asOfDate",
-        "initial_assign_text",
-        "active_provider_id",
-        "active_eff_dt",
-        "selected_provider_snapshot",
-        "last_selected_provider_id",
-        # if you added these for NPI fallback integration:
-        "npi_origin",
-        "npi_target_flow",
-        "provider_id_override",
-    ):
-        state.pop(k, None)
+builder.add_node("start", node_start)
+builder.add_node("assign_pcp_ask_termination", node_assign_pcp_ask_termination)
+builder.add_node("collect_termination_reason", node_collect_termination_reason)
+builder.add_node("collect_knows_provider", node_collect_knows_provider)
+builder.add_node("collect_provider_input", node_collect_provider_input)
+builder.add_node("collect_no_flow_filters", node_collect_no_flow_filters)
+builder.add_node("collect_filter_input", node_collect_filter_input)
+builder.add_node("run_provider_search", node_run_provider_search)
+builder.add_node("provider_interaction", node_provider_interaction)
+builder.add_node("specialist_ask_service", node_specialist_ask_service)
+builder.add_node("specialist_ask_filters", node_specialist_ask_filters)
+builder.add_node("run_specialist_generic_search", node_run_specialist_generic_search)
+builder.add_node("specialist_provider_address", node_specialist_provider_address)
+builder.add_node("specialist_post_completion", node_specialist_post_completion)
+builder.add_node("provider_id_only_warning", node_provider_id_only_warning)
+builder.add_node("return_to_menu", node_return_to_menu)
+builder.add_node("update_pcp", node_update_pcp)
+builder.add_node("wait_next_followup", node_wait_next_followup)
+builder.add_node("load_case", node_load_case)
+builder.add_node("npi_ask_mode", node_npi_ask_mode)
+builder.add_node("npi_ask_query", node_npi_ask_query)
+builder.add_node("npi_run_search", node_npi_run_search)
+builder.add_node("pcp_no_results_route", node_pcp_no_results_route)
+builder.add_node("npi_followup_action", node_npi_followup_action)
+builder.add_node("run_specialist_id_search", node_run_specialist_id_search)
+
+builder.add_edge(START, "load_case")
+builder.add_edge("load_case", "start")
+
+# From start, conditionally branch based on menu choice
+builder.add_conditional_edges(
+    "start",
+    path=route_from_menu,
+    path_map={
+        "assign_pcp": "assign_pcp_ask_termination",
+        "specialist": "specialist_ask_service",
+        "npi": "npi_ask_mode",
+        "unsupported": END,
+    },
+)
+
+builder.add_edge("assign_pcp_ask_termination", "collect_termination_reason")
+builder.add_edge("collect_termination_reason", "collect_knows_provider")
+builder.add_edge("specialist_ask_service", "specialist_ask_filters")
+builder.add_edge("specialist_ask_filters", "run_specialist_generic_search")
+# builder.add_edge("run_specialist_generic_search", "specialist_provider_address")
+builder.add_conditional_edges(
+    "run_specialist_generic_search",
+    path=route_after_specialist_search,
+    path_map={
+        "providers": "specialist_provider_address",
+        "npi": "npi_ask_mode",
+        "stop": END, # or "return_to_menu"
+    }
+)
+# builder.add_edge("specialist_provider_address", "specialist_post_completion")
+builder.add_edge("provider_id_only_warning", "provider_interaction")
+
+builder.add_conditional_edges(
+    "specialist_provider_address",
+    path=route_after_specialist_provider_address,
+    path_map={
+        "completed": "specialist_post_completion",
+        "loop": "specialist_provider_address",
+        "stop": END, # or "return_to_menu" if we prefer
+    },
+)
+
+builder.add_conditional_edges(
+    "collect_knows_provider",
+    path=route_knows_provider,
+    path_map={
+        "knows": "collect_provider_input",
+        "unknown": "collect_no_flow_filters",
+    },
+)
+
+builder.add_edge("collect_no_flow_filters", "run_provider_search")
+
+builder.add_edge("collect_provider_input", "run_provider_search")
+builder.add_edge("collect_filter_input", "run_provider_search")
+
+builder.add_conditional_edges(
+    "run_provider_search",
+    path=route_after_provider_search_results,
+    path_map={
+        "found": "provider_interaction",
+        "no_results": "pcp_no_results_route",
+    },
+)
+
+builder.add_conditional_edges(
+    "pcp_no_results_route",
+    path=route_after_no_results_offer,
+    path_map={
+        "npi": "npi_ask_mode",
+        "menu": "return_to_menu",
+        "loop": "run_provider_search",  # safest: re-run offer node again via no-results path
+    },
+)
+
+builder.add_conditional_edges(
+    "specialist_post_completion",
+    path=route_after_specialist_completion,
+    path_map={
+        "menu": "return_to_menu",
+        "end": END,
+        "stop": END,
+    },
+)
+
+builder.add_conditional_edges(
+    "provider_interaction",
+    path=route_after_provider_followup,
+    path_map={
+        "loop": "wait_next_followup",
+        "assign": "update_pcp",
+        "pid_only": "provider_id_only_warning",
+    }
+)
+
+# After user says YES in specialist completion, we show menu via return_to_menu.
+# IMPORTANT: once return_to_menu captures the next menu choice (resume value),
+# we must route from it, otherwise graph will keep resuming on return_to_menu forever.
+builder.add_conditional_edges(
+    "return_to_menu",
+    path=route_from_menu,
+    path_map={
+        "assign_pcp": "assign_pcp_ask_termination",
+        "specialist": "specialist_ask_service",
+        "npi": "npi_ask_mode", 
+        "unsupported": END,
+    },
+)
+
+builder.add_edge("npi_ask_mode", "npi_ask_query")
+builder.add_edge("npi_ask_query", "npi_run_search")
+# builder.add_edge("npi_search", "return_to_menu")
+
+builder.add_conditional_edges(
+    "npi_run_search",
+    path=route_after_npi_run_search,
+    path_map={
+        "followup": "npi_followup_action",   # fallback mode -> user selects NPI/address
+        "menu": "return_to_menu",            # menu mode -> your existing START menu behavior
+    },
+)
+
+
+# After fallback followup selection:
+# - If they selected NPI, node sets provider_id_override and knows_provider/raw_provider_input,
+#   so we can route directly into provider search.
+builder.add_conditional_edges(
+    "npi_followup_action",
+    path=route_after_npi_followup,
+    path_map={
+        "pcp": "run_provider_search",
+        "specialist": "run_specialist_id_search",
+        "loop": "npi_followup_action",
+    },
+)
+builder.add_edge("run_specialist_id_search", "specialist_provider_address")
+
+builder.add_edge("wait_next_followup", "provider_interaction")
+builder.add_edge("update_pcp", END)
