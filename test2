@@ -1,38 +1,177 @@
-requested = interrupt({
-    "stage": state["stage"],
-    "prompt": state["ai_response"],
-    "prompt_title": state["prompt_title"],
-    "prompts": state["prompts"],
-    "ai_response_code": state["ai_response_code"],
-    "ai_response_type": state["ai_response_type"],
-})
-state["csr_query"] = str(requested).strip()
-return state
+import time
+import requests
+import logging
+import os
+from requests.adapters import HTTPAdapter, Retry
+from app.config import settings
+from app.llm.telemetry import (
+    get_llm_telemetry,
+    set_llm_telemetry
+)
+from app.observability.metrics import estimate_tokens
+from time import perf_counter, sleep 
+from typing import Dict, Any
 
+logger = logging.getLogger("pcp_app")
 
+# Timeouts & retry policy
+DEFAULT_TIMEOUT = float(os.getenv("HORIZON_TIMEOUT_SECONDS", "30"))
+RETRY_TOTAL = int(os.getenv("HORIZON_RETRY_TOTAL", "3"))
+RETRY_BACKOFF = float(os.getenv("HORIZON_RETRY_BACKOFF", "0.5"))
 
-===========
+verify_val = settings.CA_BUNDLE_PATH if settings.VERIFY_SSL_SOAP else False
 
-elif stage_from_node == "ERROR":
-    ai_resp_text = prompt or last_state.get("ai_response", "")
-    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
-    pr = interrupt_payload.get("prompts")
-    if pr is None:
-        pr = last_state.get("prompts", [])
-    code = interrupt_payload.get("ai_response_code") or last_state.get("ai_response_code", 500)
-    rtype = interrupt_payload.get("ai_response_type") or last_state.get("ai_response_type", "AURA")
+# ------------------------------------------------------------------------------
+# Token cache (memory)
+# ------------------------------------------------------------------------------
+_token_cache: Dict[str, Any] = {
+    "access_token": None,
+    "expires_at": 0.0,  # epoch seconds
+}
 
-    response_payload = base_response(
-        thread_id=req.thread_id,
-        stage="ERROR",
-        ai_response=ai_resp_text,
-        csr_query=req.message or "",
-        prompts=pr,
-        prompt_title=ptitle,
-        ai_response_code=code,
-        ai_response_type=rtype,
-        call_source=call_source,
+# Simple in-memory token cache so we don’t call auth on every request
+_member_token_cache: Dict[str, Any] = {
+    "access_token": None,
+    "expires_at": 0.0,   # epoch seconds
+}
+
+def _auth_endpoint() -> str:
+    """Build Horizon OAuth token endpoint."""
+    if not settings.HORIZON_GATEWAY:
+        raise ValueError("HORIZON_GATEWAY is not set")
+    # Adjust if your Horizon auth path differs:
+    return f"{settings.HORIZON_GATEWAY}/oauth2/token"
+
+def _session_with_retries() -> requests.Session:
+    """Requests session with basic retry policy suitable for gateways."""
+    session = requests.Session()
+    retry = Retry(
+        total=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
+        raise_on_status=False,
     )
-    break
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
+def call_horizon(system_prompt: str, user_prompt: str) -> str: 
+    # print("system_prompt: ",system_prompt)  
+    auth_token = getAuthToken(settings.HORIZON_CLIENT_ID, settings.HORIZON_CLIENT_SECRET, settings.HORIZON_GATEWAY)
+    url = f"{settings.HORIZON_CHAT_ENDPOINT}"
+
+    t0 = perf_counter()
+    telemetry = get_llm_telemetry()
+    if telemetry is not None:
+        telemetry["llm_prompt_tokens"] = telemetry.get("llm_prompt_tokens", 0) + estimate_tokens(system_prompt) + estimate_tokens(user_prompt)
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {auth_token}",
+    }
+    
+    payload = {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": False,
+    }
+    # print("payload: ",payload)
+    out_text = ""
+    try:    
+        resp = requests.post(url, headers=headers, json=payload, timeout=60, verify=verify_val)
+        resp.raise_for_status()
+        data=resp.json()
+        # print(data)
+
+        content = None
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+
+                if content is None and "choices" in data and data["choices"]:
+                    choice = data["choices"][0]
+                    m = choice.get("message") or {}
+                    content = m.get("content")
+                if content is None and isinstance(data.get("text"), str):
+                    content = data["text"]
+
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )    
+
+        # if isinstance(content, str):
+        #     return content.strip()
+        out_text = content.strip() if isinstance(content, str) else str(data)
+
+        # if isinstance(content, str):
+        #     out_text = content.strip()
+        #     if telemetry is not None:
+        #         telemetry["llm_completion_tokens"] = telemetry.get("llm_completion_tokens", 0) + estimate_tokens(out_text)
+        #         telemetry["llm_latency_ms"] = telemetry.get("llm_latency_ms", 0.0) + (perf_counter() - t0) * 1000
+        #     return out_text
+        if telemetry is not None:
+                telemetry["llm_completion_tokens"] = telemetry.get("llm_completion_tokens", 0) + estimate_tokens(out_text)
+
+        return out_text
+    finally:
+        if telemetry is not None:
+            telemetry["llm_latency_ms"] = telemetry.get("llm_latency_ms", 0.0) + (perf_counter() - t0) * 1000
+    
+    return str(data)
+
+def getAuthToken(client_id: str, client_secret: str, address: str) -> str:
+    """
+    Get (and cache) a Horizon Bearer token via client_credentials.
+    - Respects in-memory cache until expiry (with a small safety margin).
+    - Set env HORIZON_VERIFY_SSL to 'false' for dev self-signed, or to a CA bundle path.
+    """
+    # If a valid, non-expired token is cached, return it
+    now = time.time()
+    if _token_cache["access_token"] and now < _token_cache["expires_at"] - 10:
+        return _token_cache["access_token"]
+
+    # Validate inputs
+    if not address:
+        raise ValueError("Horizon address is required (HORIZON_GATEWAY).")
+    if not client_id or not client_secret:
+        raise ValueError("Horizon client_id/client_secret are required.")
+
+    url = _auth_endpoint()
+    # Most gateways accept standard OAuth2 client_credentials form body
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    
+    session = _session_with_retries()
+    try:
+        resp = session.post(url, data=data, headers=headers, timeout=DEFAULT_TIMEOUT, verify=verify_val)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        access_token = payload.get("access_token")
+        expires_in = payload.get("expires_in", 3600)  # seconds
+        if not access_token:
+            raise ValueError(f"Token endpoint missing 'access_token'. Response: {payload}")
+
+        _token_cache["access_token"] = access_token
+        _token_cache["expires_at"] = time.time() + float(expires_in)
+        return access_token
+
+    except requests.RequestException as e:
+        logger.error("Horizon token request failed: %s", e, exc_info=True)
+        raise
+    except ValueError as e:
+        logger.error("Invalid token response: %s", e, exc_info=True)
+        raise
