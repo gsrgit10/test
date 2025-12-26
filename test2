@@ -1,230 +1,64 @@
-if not providers:
-    # mark that we are entering NPI flow as fallback from specialist
-    state["npi_origin"] = "fallback"
-    state["npi_target_flow"] = "specialist"
-
-    # clear any previous NPI state so NPI starts fresh
-    state.pop("npi_results_payload", None)
-    state.pop("npi_mode", None)
-    state.pop("npi_query", None)
-    state.pop("provider_id_override", None)
-
-    # IMPORTANT: return state such that your graph routes to npi_ask_mode
-    # (you already did this pattern for PCP fallback)
-    state["stage"] = "GO_NPI"
-    return state
-
-=============================================================
-
-def node_npi_ask_mode(state: PCPState) -> PCPState:
-    logger.debug("node_npi_ask_mode")
-
-    # If not explicitly set by fallback, this is menu entry
-    if not state.get("npi_origin"):
-        state["npi_origin"] = "menu"
-    if not state.get("npi_target_flow"):
-        state["npi_target_flow"] = "pcp"   # default; fallback will override to "specialist"
-
-    # Always reset NPI search inputs when entering ask mode
-    state.pop("npi_results_payload", None)
-    state.pop("npi_query", None)
-    state.pop("npi_mode", None)
-
-    ...
-
-
-===============================================
-
-def node_run_specialist_id_search(state: PCPState) -> PCPState:
+def llm_parse_no_flow_filters(user_text: str) -> Dict[str, Any]:
     """
-    Specialist fallback after NPI selection:
-      - provider_id_override contains NPI (10-digit)
-      - calls provider_search_by_id(id=<NPI>, group_id/subscriber_id/asOfDate same as existing)
-      - shows grid using stage SHOW_SPECIALIST_PROVIDER_LIST
-      - next node remains specialist_provider_address (existing)
+    Extract NO-flow filter inputs from user text.
+
+    Returns ONLY JSON:
+    {
+      "use_defaults": boolean,
+      "language": string | null,          # e.g. "Spanish"
+      "gender": "M" | "F" | null,         # normalize to M/F
+      "zip": string | null,               # 5-digit
+      "as_of_date": string | null,        # YYYYMMDD
+      "radius_in_miles": number | null    # only if user explicitly wants change
+    }
     """
-    logger.debug("node_run_specialist_id_search")
+    system = (
+        "You are an AI that extracts PCP provider-search filters from text.\n"
+        "Return ONLY valid JSON with this schema:\n"
+        "{\n"
+        '  "use_defaults": boolean,\n'
+        '  "language": string | null,\n'
+        '  "gender": "M" | "F" | null,\n'
+        '  "zip": string | null,\n'
+        '  "as_of_date": string | null,\n'
+        '  "radius_in_miles": number | null\n'
+        "}\n"
+        "Rules:\n"
+        "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
+        "- Otherwise use_defaults=false.\n"
+        "- zip must be exactly 5 digits if present.\n"
+        "- gender must be M or F when user implies male/female; if unclear use null.\n"
+        "- If user provides a date in ANY format, convert to YYYYMMDD.\n"
+        "- Only set radius_in_miles if the user explicitly asks to change the default distance.\n"
+        "Return JSON only."
+    )
+    print("user text: ",user_text)
+    raw = call_horizon(system, user_text).strip()
+    print("raw: ",raw)
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        idx = raw.find("{")
+        if idx != -1:
+            raw = raw[idx:]
 
-    pid = (state.get("provider_id_override") or "").strip()
-    if not pid:
-        # if missing, bounce back to NPI mode safely
-        state["stage"] = "NPI_ASK_MODE"
-        return state
-
-    # Clear override after consuming so it does not repeat
-    state["provider_id_override"] = None
-
-    group_id = (state.get("group_id") or "").strip()
-    subscriber_id = (state.get("subscriber_id") or "").strip()
-
-    if not group_id or not subscriber_id:
-        # Horizon error message (no hardcode)
-        sys = (
-            "You are a CSR assistant. Member identifiers are missing. "
-            "Return a short message asking the user to restart the conversation. Return ONLY the text."
-        )
-        msg = call_horizon(sys, "Generate the message.").strip()
-        mark_llm(state)
-
-        state["ai_response"] = msg
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 500
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "ERROR"
-        return state
-
-    # Call your existing provider-by-id API using NPI as id param
     try:
-        mark_api(state, provider_search_by_id)
-        providers = provider_search_by_id(
-            id=pid,
-            group_id=group_id,
-            subscriber_id=subscriber_id,
-            asOfDate=state.get("asOfDate", ""),
-        )
-    except Exception as ex:
-        logger.exception("Specialist provider_search_by_id failed: %s", ex)
-        sys = (
-            "You are a CSR assistant. The system could not fetch provider results right now. "
-            "Return a short apology + retry suggestion. Return ONLY the text."
-        )
-        msg = call_horizon(sys, str(ex)).strip()
-        mark_llm(state)
-
-        state["ai_response"] = msg
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 500
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "ERROR"
-        return state
-
-    # If still empty, optionally keep NPI loop (Horizon text)
-    if not providers:
-        sys = (
-            "You are a CSR assistant. The selected NPI did not return any provider record in the internal directory. "
-            "Ask the user to try another NPI from the list or search again. Return ONLY the text."
-        )
-        msg = call_horizon(sys, pid).strip()
-        mark_llm(state)
-
-        state["ai_response"] = msg
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 101
-        state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "NPI_SHOW_RESULTS"
-
-        requested = interrupt({"prompt": msg, "stage": state["stage"]})
-        state["csr_query"] = str(requested).strip()
-        return state
-
-    # Build SAME grid JSON as your other provider grids
-    grid_list: List[Dict[str, Any]] = []
-    for p in providers:
-        prov_id = (
-            p.get("providerId")
-            or p.get("provId")
-            or p.get("ProviderID")
-            or ""
-        )
-        name_val = (
-            p.get("name")
-            or p.get("providerName")
-            or p.get("fullName")
-            or ""
-        )
-        addr = _format_address_from_provider(p)
-
-        raw_network = p.get("networkStatus") or p.get("network") or ""
-        raw_up = str(raw_network).upper()
-        if raw_up in ("IN", "IN NETWORK"):
-            net_str = "In Network"
-        elif raw_up in ("OUT", "OUT NETWORK"):
-            net_str = "Out Network"
-        else:
-            net_str = str(raw_network) if raw_network else ""
-
-        grid_list.append({
-            "ProviderID": str(prov_id),
-            "Name": str(name_val),
-            "Address": addr,
-            "Network": net_str,
-            "IsAcceptingNewMembers": p.get("isAcceptingNewMembers"),
-            "PCPAssnInd": p.get("pcpAssnInd") or p.get("PCPAssnInd"),
-            "DistanceInMiles": p.get("distance_mi") or p.get("distanceInMiles"),
-        })
-
-    state["providers_result"] = providers
-    state["ai_response"] = json.dumps({"providers": grid_list}, default=str, separators=(",", ":"))
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 107
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["stage"] = "SHOW_SPECIALIST_PROVIDER_LIST"
-
-    requested = interrupt({"prompt": state["ai_response"], "stage": state["stage"]})
-    state["csr_query"] = str(requested).strip()
-    return state
-
-
-=======================================================================================
-
-    if action == "select_npi" and npi_str:
-        state["provider_id_override"] = npi_str
-
-        # Clear any previous provider results so next search runs
-        state["providers_result"] = None
-
-        # Decide target flow
-        tgt = (state.get("npi_target_flow") or "pcp").strip().lower()
-        state["stage"] = "NPI_SELECTED"
-
-        # Stop NPI loop state so it doesn't replay
-        state.pop("npi_results_payload", None)
-        state.pop("npi_mode", None)
-        state.pop("npi_query", None)
-
-        # If specialist fallback, we do NOT set knows_provider/raw_provider_input for PCP flow
-        # We will route to specialist-id-search node
-        if tgt == "specialist":
-            return state
-
-        # PCP flow default (existing behavior)
-        state["knows_provider"] = True
-        state["raw_provider_input"] = npi_str
-        return state
-
-
-===================================================================================
-
-builder.add_node("run_specialist_id_search", node_run_specialist_id_search)
-
-
-def route_after_npi_followup(state: PCPState) -> str:
-    tgt = (state.get("npi_target_flow") or "pcp").strip().lower()
-    # if we have an override id, proceed; otherwise keep looping in npi followup
-    if not (state.get("provider_id_override") or ""):
-        return "loop"
-    return "specialist" if tgt == "specialist" else "pcp"
-
-
-from app.graph.routing import route_after_npi_followup
-
-builder.add_conditional_edges(
-    "npi_followup_action",
-    path=route_after_npi_followup,
-    path_map={
-        "pcp": "run_provider_search",
-        "specialist": "run_specialist_id_search",
-        "loop": "npi_followup_action",
-    },
-)
-
-
-builder.add_edge("run_specialist_id_search", "specialist_provider_address")
-
-
-================================================
-
+        data = json.loads(raw)
+        # Defensive defaults
+        return {
+            "use_defaults": bool(data.get("use_defaults", False)),
+            "language": data.get("language"),
+            "gender": data.get("gender"),
+            "zip": data.get("zip"),
+            "as_of_date": data.get("as_of_date"),
+            "radius_in_miles": data.get("radius_in_miles"),
+        }
+    except Exception:
+        logger.warning("Failed to parse NO-flow filter JSON from LLM: %s", raw)
+        return {
+            "use_defaults": False,
+            "language": None,
+            "gender": None,
+            "zip": None,
+            "as_of_date": None,
+            "radius_in_miles": None,
+        }
