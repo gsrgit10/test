@@ -1,64 +1,22 @@
-def llm_parse_no_flow_filters(user_text: str) -> Dict[str, Any]:
-    """
-    Extract NO-flow filter inputs from user text.
-
-    Returns ONLY JSON:
-    {
-      "use_defaults": boolean,
-      "language": string | null,          # e.g. "Spanish"
-      "gender": "M" | "F" | null,         # normalize to M/F
-      "zip": string | null,               # 5-digit
-      "as_of_date": string | null,        # YYYYMMDD
-      "radius_in_miles": number | null    # only if user explicitly wants change
-    }
-    """
-    system = (
-        "You are an AI that extracts PCP provider-search filters from text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{\n"
-        '  "use_defaults": boolean,\n'
-        '  "language": string | null,\n'
-        '  "gender": "M" | "F" | null,\n'
-        '  "zip": string | null,\n'
-        '  "as_of_date": string | null,\n'
-        '  "radius_in_miles": number | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
-        "- Otherwise use_defaults=false.\n"
-        "- zip must be exactly 5 digits if present.\n"
-        "- gender must be M or F when user implies male/female; if unclear use null.\n"
-        "- If user provides a date in ANY format, convert to YYYYMMDD.\n"
-        "- Only set radius_in_miles if the user explicitly asks to change the default distance.\n"
-        "Return JSON only."
-    )
-    print("user text: ",user_text)
-    raw = call_horizon(system, user_text).strip()
-    print("raw: ",raw)
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        idx = raw.find("{")
-        if idx != -1:
-            raw = raw[idx:]
-
-    try:
-        data = json.loads(raw)
-        # Defensive defaults
-        return {
-            "use_defaults": bool(data.get("use_defaults", False)),
-            "language": data.get("language"),
-            "gender": data.get("gender"),
-            "zip": data.get("zip"),
-            "as_of_date": data.get("as_of_date"),
-            "radius_in_miles": data.get("radius_in_miles"),
-        }
-    except Exception:
-        logger.warning("Failed to parse NO-flow filter JSON from LLM: %s", raw)
-        return {
-            "use_defaults": False,
-            "language": None,
-            "gender": None,
-            "zip": None,
-            "as_of_date": None,
-            "radius_in_miles": None,
-        }
+system = (
+    "You extract PCP provider-search filters from text.\n"
+    "Return ONLY valid JSON with this schema:\n"
+    "{\n"
+    '  "use_defaults": boolean,\n'
+    '  "language": string | null,\n'
+    '  "gender": string | null,\n'
+    '  "zip": string | null,\n'
+    '  "as_of_date": string | null,\n'
+    '  "radius_in_miles": number | null\n'
+    "}\n"
+    "Rules:\n"
+    "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
+    "- Otherwise use_defaults=false.\n"
+    "- PASS-THROUGH: If the user provides a value, return it exactly as written (do NOT validate).\n"
+    "- language: if user mentions any language (even random text like 'abc'), put it in language exactly.\n"
+    "- gender: if user provides anything for gender (male/female/either/abc), return it exactly.\n"
+    "- zip: if user provides any zip/postal value, return it exactly (even if not 5 digits).\n"
+    "- as_of_date: if user provides a date, convert it to YYYYMMDD; if no date, null.\n"
+    "- radius_in_miles: only set if the user explicitly provides a number for distance/radius; else null.\n"
+    "Return JSON only."
+)
