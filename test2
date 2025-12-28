@@ -1,108 +1,57 @@
-if not providers:
-    # we came here from specialist flow
-    state["npi_origin"] = "fallback"
-    state["npi_target_flow"] = "specialist"
+    if not providers:
+        # ✅ Ask "No results -> try NPI?" via Horizon and INTERRUPT
+        state["providers_result"] = None
+        state["npi_origin"] = "fallback"
+        state["npi_target_flow"] = "specialist"
 
-    # clear previous NPI state (start fresh)
-    state.pop("npi_results_payload", None)
-    state.pop("npi_mode", None)
-    state.pop("npi_query", None)
-    state.pop("provider_id_override", None)
+        # Clear any old NPI state
+        for k in ("npi_results_payload", "npi_mode", "npi_query", "provider_id_override"):
+            state.pop(k, None)
 
-    # Horizon generates the offer question (no hardcoded message content)
-    search_basis = (state.get("specialist_raw_filter_input") or "").strip()
-    if not search_basis:
-        search_basis = (state.get("specialist_service_specialty") or "").strip()
+        # Build the question with Horizon (no hardcoded sentence)
+        sys = (
+            "You are a CSR assistant.\n"
+            "The specialist provider search returned no results.\n"
+            "Ask the user if they would like to try the NPI Web search instead.\n"
+            "Return ONLY the question text (no JSON, no markdown).\n"
+            "The question must mention that no record was found for the provided input.\n"
+        )
+        search_basis = (state.get("specialist_raw_filter_input") or "").strip()
+        user = f"No specialist provider record found for: {search_basis}"
 
-    sys = (
-        "You are a CSR assistant.\n"
-        "The internal specialist search returned no results.\n"
-        "Ask the user if they would like to try the NPI Web search instead.\n"
-        "Return ONLY the question text (no JSON, no markdown fences).\n"
-        "The question must mention that no record was found for the provided input.\n"
-    )
-    user = f"No specialist record found for: {search_basis}"
-    try:
-        offer_q = call_horizon(sys, user).strip()
-    except requests.exceptions.ReadTimeout:
-        state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
+        try:
+            offer_q = call_horizon(sys, user).strip()
+        except requests.exceptions.ReadTimeout:
+            state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
+            state["ai_response_type"] = "AURA"
+            state["ai_response_code"] = 500
+            state["prompt_title"] = ""
+            state["prompts"] = []
+            state["stage"] = "ERROR"
+            return state
+
+        mark_llm(state)
+
+        # ✅ IMPORTANT: put the offer question into AIResponse and also into prompt
+        state["ai_response"] = offer_q
         state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 500
+        state["ai_response_code"] = 101
         state["prompt_title"] = ""
-        state["prompts"] = []
-        state["stage"] = "ERROR"
+        state["prompts"] = ["Yes", "No"]
+        state["stage"] = "SPECIALIST_NO_RESULTS_OFFER_NPI"
+
+        requested = interrupt({
+            "prompt": state["ai_response"],   # ✅ do not send empty prompt
+            "stage": state["stage"],
+            "prompt_title": state["prompt_title"],
+            "prompts": state["prompts"],
+            "ai_response_code": state["ai_response_code"],
+            "ai_response_type": state["ai_response_type"],
+        })
+
+        state["csr_query"] = str(requested).strip()
         return state
 
-    mark_llm(state)
 
-    # Ask yes/no
-    state["ai_response"] = ""
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 101
-    state["prompt_title"] = offer_q
-    state["prompts"] = ["Yes", "No"]
-    state["stage"] = "SPECIALIST_NO_RESULTS_OFFER_NPI"
+=============================================================
 
-    requested = interrupt({
-        "prompt": "",
-        "stage": state["stage"],
-        "prompt_title": state["prompt_title"],
-        "prompts": state["prompts"],
-        "ai_response_code": state["ai_response_code"],
-        "ai_response_type": state["ai_response_type"],
-    })
-
-    # classify yes/no using your existing Horizon-based classifier (no hardcoded match)
-    ans = llm_classify_yes_no(str(requested).strip())
-
-    if ans == "yes":
-        state["stage"] = "GO_NPI"
-        state["csr_query"] = ""
-        return state
-
-    if ans == "no":
-        state["stage"] = "GO_MENU"
-        state["csr_query"] = ""
-        return state
-
-    # unknown -> re-ask once (no graph recursion)
-    requested2 = interrupt({
-        "prompt": "",
-        "stage": state["stage"],
-        "prompt_title": state["prompt_title"],
-        "prompts": state["prompts"],
-        "ai_response_code": state["ai_response_code"],
-        "ai_response_type": state["ai_response_type"],
-    })
-    ans2 = llm_classify_yes_no(str(requested2).strip())
-
-    state["csr_query"] = ""
-    state["stage"] = "GO_NPI" if ans2 == "yes" else "GO_MENU"
-    return state
-
-===========================
-
-def route_after_specialist_search(state: PCPState) -> str:
-    st = (state.get("stage") or "").strip().upper()
-
-    if st == "GO_NPI":
-        return "npi"
-
-    if st in ("GO_MENU", "START", "MENU"):
-        return "menu"
-
-    if state.get("providers_result"):
-        return "providers"
-
-    return "stop"
-==========================================
-builder.add_conditional_edges(
-    "run_specialist_generic_search",
-    path=route_after_specialist_search,
-    path_map={
-        "providers": "specialist_provider_address",
-        "npi": "npi_ask_mode",
-        "menu": "return_to_menu",
-        "stop": END,
-    },
-)
