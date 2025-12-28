@@ -1,53 +1,108 @@
-def node_assign_pcp_ask_termination(state: PCPState) -> PCPState:
-    logger = logging.getLogger("pcp.assign_pcp")
-    logger.debug("node_assign_pcp_ask_termination, state=%s", state)
+if not providers:
+    # we came here from specialist flow
+    state["npi_origin"] = "fallback"
+    state["npi_target_flow"] = "specialist"
 
-    # ✅ IMPORTANT: If we entered Assign-PCP from a menu selection,
-    # wipe transient PCP keys so we NEVER treat "Assign PCP" as termination_reason.
-    st = (state.get("stage") or "").strip().upper()
-    if st in ("START", "MENU", "GO_MENU"):
-        for k in (
-            "termination_reason",
-            "knows_provider",
-            "raw_provider_input",
-            "raw_filter_input",
-            "providers_result",
-            "provider_id",
-            "provider_name",
-            "provider_city",
-            "provider_state",
-            "startingLocationZip",
-            "asOfDate",
-            "last_followup_action",
-            "initial_assign_text",
-            "last_selected_provider_id",
-            "selected_provider_snapshot",
-            "provider_id_override",
-        ):
-            state.pop(k, None)
+    # clear previous NPI state (start fresh)
+    state.pop("npi_results_payload", None)
+    state.pop("npi_mode", None)
+    state.pop("npi_query", None)
+    state.pop("provider_id_override", None)
 
-        # also make sure we do not carry the menu selection forward as a "reason"
+    # Horizon generates the offer question (no hardcoded message content)
+    search_basis = (state.get("specialist_raw_filter_input") or "").strip()
+    if not search_basis:
+        search_basis = (state.get("specialist_service_specialty") or "").strip()
+
+    sys = (
+        "You are a CSR assistant.\n"
+        "The internal specialist search returned no results.\n"
+        "Ask the user if they would like to try the NPI Web search instead.\n"
+        "Return ONLY the question text (no JSON, no markdown fences).\n"
+        "The question must mention that no record was found for the provided input.\n"
+    )
+    user = f"No specialist record found for: {search_basis}"
+    try:
+        offer_q = call_horizon(sys, user).strip()
+    except requests.exceptions.ReadTimeout:
+        state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    mark_llm(state)
+
+    # Ask yes/no
+    state["ai_response"] = ""
+    state["ai_response_type"] = "AURA"
+    state["ai_response_code"] = 101
+    state["prompt_title"] = offer_q
+    state["prompts"] = ["Yes", "No"]
+    state["stage"] = "SPECIALIST_NO_RESULTS_OFFER_NPI"
+
+    requested = interrupt({
+        "prompt": "",
+        "stage": state["stage"],
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+
+    # classify yes/no using your existing Horizon-based classifier (no hardcoded match)
+    ans = llm_classify_yes_no(str(requested).strip())
+
+    if ans == "yes":
+        state["stage"] = "GO_NPI"
         state["csr_query"] = ""
-==============================
-def node_collect_termination_reason(state: PCPState) -> PCPState:
-    logger.debug("node_collect_termination_reason")
-
-    if state.get("termination_reason"):
         return state
 
-    reason = (state.get("csr_query") or "").strip()
-    if not reason:
-        return state
-
-    # ✅ Safety: do not treat menu choice as termination reason
-    menu_prompts = getattr(settings, "MENU_PROMPTS", None)
-    if not isinstance(menu_prompts, list) or not menu_prompts:
-        menu_prompts = settings.DEFAULT_PROMPTS
-
-    if reason in menu_prompts:
+    if ans == "no":
+        state["stage"] = "GO_MENU"
         state["csr_query"] = ""
         return state
 
-    state["termination_reason"] = reason
+    # unknown -> re-ask once (no graph recursion)
+    requested2 = interrupt({
+        "prompt": "",
+        "stage": state["stage"],
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+    ans2 = llm_classify_yes_no(str(requested2).strip())
+
     state["csr_query"] = ""
+    state["stage"] = "GO_NPI" if ans2 == "yes" else "GO_MENU"
     return state
+
+===========================
+
+def route_after_specialist_search(state: PCPState) -> str:
+    st = (state.get("stage") or "").strip().upper()
+
+    if st == "GO_NPI":
+        return "npi"
+
+    if st in ("GO_MENU", "START", "MENU"):
+        return "menu"
+
+    if state.get("providers_result"):
+        return "providers"
+
+    return "stop"
+==========================================
+builder.add_conditional_edges(
+    "run_specialist_generic_search",
+    path=route_after_specialist_search,
+    path_map={
+        "providers": "specialist_provider_address",
+        "npi": "npi_ask_mode",
+        "menu": "return_to_menu",
+        "stop": END,
+    },
+)
