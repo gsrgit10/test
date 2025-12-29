@@ -1,36 +1,72 @@
-    # ------------------------------------------------------------------
-    # ✅ Resume handler: user answered the "No results -> NPI?" question
-    # ------------------------------------------------------------------
-    if (state.get("stage") or "").strip().upper() == "SPECIALIST_NO_RESULTS_OFFER_NPI":
-        ans = llm_classify_yes_no((state.get("csr_query") or "").strip())
+def route_after_specialist_no_results_offer(state: PCPState) -> str:
+    """
+    After we asked: "No specialist results -> try NPI web search?"
+    """
+    txt = (state.get("csr_query") or "").strip()
+    ans = llm_classify_yes_no(txt)
+    if ans == "yes":
+        return "npi"
+    if ans == "no":
+        return "menu"
+    return "loop"
 
-        if ans == "yes":
-            state["npi_origin"] = "fallback"
-            state["npi_target_flow"] = "specialist"
-            state["csr_query"] = ""
-            state["stage"] = "GO_NPI"
-            return state
+===============================
 
-        if ans == "no":
-            state["csr_query"] = ""
-            state["stage"] = "GO_MENU"
-            return state
+def node_specialist_no_results_offer(state: PCPState) -> PCPState:
+    """
+    Show: no results found -> ask if user wants NPI search (Yes/No).
+    Keep UI contract same as PCP: question in prompt_title, ai_response empty.
+    """
+    logger.debug("node_specialist_no_results_offer")
 
-        # unknown -> ask again (same offer screen)
-        requested = interrupt({
-            "prompt": "",  # UI uses prompt_title for AURA
-            "stage": "SPECIALIST_NO_RESULTS_OFFER_NPI",
-            "prompt_title": state.get("prompt_title") or "",
-            "prompts": state.get("prompts") or ["Yes", "No"],
-            "ai_response_code": state.get("ai_response_code") or 101,
-            "ai_response_type": state.get("ai_response_type") or "AURA",
-        })
-        state["csr_query"] = str(requested).strip()
+    # Build question with Horizon (no hardcode)
+    sys = (
+        "You are a CSR assistant.\n"
+        "The specialist provider search returned no results.\n"
+        "Ask the user if they would like to try the NPI Web search instead.\n"
+        "Return ONLY the question text (no JSON, no markdown).\n"
+        "The question must mention that no record was found for the provided input.\n"
+    )
+    search_basis = (state.get("specialist_raw_filter_input") or "").strip()
+    user = f"No specialist provider record found for: {search_basis}"
+
+    try:
+        offer_q = call_horizon(sys, user).strip()
+    except requests.exceptions.ReadTimeout:
+        state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
         return state
 
-========================
+    mark_llm(state)
 
-        if not providers:
+    state["ai_response"] = ""
+    state["ai_response_type"] = "AURA"
+    state["ai_response_code"] = 101
+    state["prompt_title"] = offer_q
+    state["prompts"] = ["Yes", "No"]
+    state["stage"] = "SPECIALIST_NO_RESULTS_OFFER_NPI"
+
+    requested = interrupt({
+        "prompt": "",
+        "stage": state["stage"],
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+
+    state["csr_query"] = str(requested).strip()
+    return state
+
+
+===========================================
+
+    if not providers:
+        # mark that we are entering NPI offer flow from specialist
         state["providers_result"] = None
         state["npi_origin"] = "fallback"
         state["npi_target_flow"] = "specialist"
@@ -39,47 +75,34 @@
         for k in ("npi_results_payload", "npi_mode", "npi_query", "provider_id_override"):
             state.pop(k, None)
 
-        # Horizon question (no hardcode)
-        sys = (
-            "You are a CSR assistant.\n"
-            "The specialist provider search returned no results.\n"
-            "Ask the user if they would like to try the NPI Web search instead.\n"
-            "Return ONLY the question text (no JSON, no markdown).\n"
-            "The question must mention that no record was found for the provided input.\n"
-        )
-        search_basis = (state.get("specialist_raw_filter_input") or "").strip()
-        user = f"No specialist provider record found for: {search_basis}"
-
-        try:
-            offer_q = call_horizon(sys, user).strip()
-        except requests.exceptions.ReadTimeout:
-            state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
-            state["ai_response_type"] = "AURA"
-            state["ai_response_code"] = 500
-            state["prompt_title"] = ""
-            state["prompts"] = []
-            state["stage"] = "ERROR"
-            return state
-
-        mark_llm(state)
-
-        # ✅ UI-compatible Yes/No question (same pattern as PCP)
-        state["ai_response"] = ""                 # IMPORTANT
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 101
-        state["prompt_title"] = offer_q           # IMPORTANT
-        state["prompts"] = ["Yes", "No"]
+        # IMPORTANT: route to offer node (do not re-ask filters)
         state["stage"] = "SPECIALIST_NO_RESULTS_OFFER_NPI"
-
-        requested = interrupt({
-            "prompt": "",  # IMPORTANT: keep empty, UI reads prompt_title + prompts
-            "stage": state["stage"],
-            "prompt_title": state["prompt_title"],
-            "prompts": state["prompts"],
-            "ai_response_code": state["ai_response_code"],
-            "ai_response_type": state["ai_response_type"],
-        })
-
-        state["csr_query"] = str(requested).strip()
         return state
-  
+
+
+=========================================
+
+builder.add_node("specialist_no_results_offer", node_specialist_no_results_offer)
+
+builder.add_conditional_edges(
+    "run_specialist_generic_search",
+    path=route_after_specialist_search,
+    path_map={
+        "providers": "specialist_provider_address",
+        "offer": "specialist_no_results_offer",
+        "npi": "npi_ask_mode",
+        "menu": "return_to_menu",
+        "stop": END,
+    }
+)
+
+
+builder.add_conditional_edges(
+    "specialist_no_results_offer",
+    path=route_after_specialist_no_results_offer,
+    path_map={
+        "npi": "npi_ask_mode",
+        "menu": "return_to_menu",
+        "loop": "specialist_no_results_offer",
+    }
+)
