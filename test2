@@ -1,66 +1,583 @@
-import cProfile
-import os
-import time
-from pathlib import Path
-from typing import Callable, Any, Optional
+from datetime import datetime
+from time import perf_counter
+from typing import Dict, Any, Optional
+import uuid
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse
+import logfire
+import logging
 
-def _safe_filename(s: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in s)[:180]
-
-def run_cprofile(
-    fn: Callable[[], Any],
-    *,
-    enabled: bool,
-    out_dir: str = "profiles",
-    label: str = "request",
-) -> Any:
-    """
-    Runs fn() under cProfile only when enabled=True.
-    Writes a .prof file and returns fn() result.
-    """
-    if not enabled:
-        return fn()
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    prof_path = Path(out_dir) / f"{_safe_filename(label)}-{ts}-{int(time.time() * 1000)}.prof"
-
-    pr = cProfile.Profile()
-    try:
-        pr.enable()
-        return fn()
-    finally:
-        pr.disable()
-        pr.dump_stats(str(prof_path))
-
-
-===============================
-
-from app.utils.profiling import run_cprofile
+from pydantic import BaseModel
+from app.graph.state import PCPState
+from app.graph.nodes import graph
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Command, interrupt
+from langgraph.checkpoint.memory import InMemorySaver
 from app.config import settings
+from app.api.responses import base_response
+from app.llm.telemetry import set_llm_telemetry
+from app.observability.metrics import (
+    SESSION_TOKEN_TOTALS,
+    _blank_token_totals,
+    estimate_tokens,
+    metrics_lock,
+    token_totals_lock,
+    _append_metrics_row
+)
 
-# Example: /chat endpoint signature
+logger = logging.getLogger("pcp_app")
+
+router = APIRouter()
+
+class ChatRequest(BaseModel):
+    thread_id: str
+    message: str
+
+def config_for_thread(thread_id: str) -> Dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}
+
+@router.get("/init-conversation")
+def init_conversation(member_id: str, interaction_id: str):
+    """
+    Start the assign PCP conversation:
+    - member_id is taken as a query parameter (GET)
+    - Creates a new thread_id
+    - Runs graph until the first interrupt
+    - Returns AIResponse + Prompts + CurrentStage
+    """
+    if not member_id:
+        raise HTTPException(status_code=400, detail="member_id is required")
+
+    thread_id = str(uuid.uuid4())
+    cfg = config_for_thread(thread_id)
+
+    initial_state: PCPState = {
+        "thread_id": thread_id,
+        "member_id": member_id.strip(),
+        "interaction_id": (interaction_id or "").strip(),
+        "stage": "",
+        "csr_query": "",
+        "ai_response": "",
+        "prompts": [],
+    }
+
+    last_state: PCPState = initial_state
+    for event in graph.stream(initial_state, cfg):
+        if "__interrupt__" in event:
+            # Node already populated ai_response etc.
+            for k, value in event.items():
+                if k != "__interrupt__":
+                    last_state = value
+            call_source = (
+                last_state.get("call_name")
+                or last_state.get("call_type")
+                or getattr(settings, "CALL_SOURCE_LLM_LABEL", "LLM")
+            )
+            return JSONResponse(
+                base_response(
+                    thread_id=thread_id,
+                    ai_response= "",
+                    stage = "START",
+                    csr_query= "",
+                    prompts=settings.DEFAULT_PROMPTS,
+                    ai_response_code = 101,
+                    ai_response_type="AURA",
+                    prompt_title="How can I assist you today?",
+                    call_source=call_source
+                    )
+                )
+        for _, value in event.items():
+            last_state = value
+
+    return JSONResponse(base_response(thread_id, last_state))
+
+
 @router.post("/chat")
-def chat(req: ChatRequest, profile: int = 0):
-    # profile=1 triggers profiling for this request only (safe)
-    profile_enabled = bool(profile)
+def chat(req: ChatRequest, request: Request):
+    """
+    Resume the conversation using LangGraph interrupt resume:
+    - Uses Command(resume=message)
+    - Runs until next interrupt or completion
+    """
+    request_start = perf_counter()
+    telemetry: Dict[str, Any] = {
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_latency_ms": 0.0,
+        "thread_id": req.thread_id,
+    }
+    response_payload: Dict[str, Any] = {}
+    error: Optional[Exception] = None
 
-    def _run_graph():
-        # Whatever you already do here:
-        # result = graph.invoke(...)
-        # OR result = graph.stream(...)
-        return graph.invoke(
-            {"member_id": req.member_id, "csr_query": req.message, "thread_id": req.thread_id},
-            config={"configurable": {"thread_id": req.thread_id}},
+    set_llm_telemetry(telemetry)
+
+    if not req.thread_id:
+        raise HTTPException(status_code=400, detail="thread_id is required")
+
+    cfg = config_for_thread(req.thread_id)
+    last_state: PCPState = {}
+    call_source = ""
+    resume_cmd = Command(resume=req.message)
+
+    for event in graph.stream(resume_cmd, cfg):
+        if "__interrupt__" in event:
+            for k, value in event.items():
+                if k != "__interrupt__":
+                    last_state = value
+            
+            interrupt_payloads = event["__interrupt__"]
+            interrupt_payload = interrupt_payloads[0].value if interrupt_payloads else {}
+            call_source = interrupt_payload.get("call_name") or last_state.get("call_name") or ""
+            prompt = interrupt_payload.get("prompt", "")
+            stage_from_node = interrupt_payload.get("stage", last_state.get("stage", ""))
+
+            if stage_from_node == "WAIT_TERMINATION_REASON":
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage = "WAIT_TERMINATION_REASON",
+                        ai_response=prompt,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=112,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            
+            elif stage_from_node == "ASK_KNOWS_PROVIDER":
+                question_title = prompt or last_state.get("prompt_title") or ""
+                prompts_list = last_state.get("prompts") or ["Yes", "No"]
+
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage = "ASK_KNOWS_PROVIDER",
+                        ai_response="",
+                        csr_query=req.message or "",
+                        prompts=prompts_list,
+                        prompt_title=question_title,
+                        ai_response_code=101,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+            
+            elif stage_from_node == "ASK_PROVIDER_INPUT":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+
+                response_payload =base_response(
+                        thread_id=req.thread_id,
+                        stage = "ASK_PROVIDER_INPUT",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=103,
+                        ai_response_type="Dialog",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+            
+            # Provider List (ID search) - show JSON grid to user
+            elif stage_from_node == "SHOW_PROVIDER_LIST":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage = "SHOW_PROVIDER_LIST",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="Select a provider id to update",
+                        ai_response_code=107,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+            
+            elif stage_from_node == "WAIT_NEXT_FOLLOWUP":
+                response_payload =base_response(
+                        thread_id=req.thread_id,
+                        stage=last_state.get("stage", ""),
+                        ai_response=last_state.get("ai_response", ""),
+                        csr_query=req.message or "",
+                        prompts=last_state.get("prompts", []),
+                        prompt_title=last_state.get("prompt_title", ""),
+                        ai_response_code=last_state.get("ai_response_code", 101),
+                        ai_response_type=last_state.get("ai_response_type", "AURA"),
+                        call_source = call_source,
+                )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "ASK_NO_FLOW_FILTERS":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                prompts_list = (
+                    interrupt_payload.get("prompts")
+                    or last_state.get("prompts")
+                    or ["Please proceed with the default values."]
+                )
+
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="ASK_NO_FLOW_FILTERS",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=prompts_list,
+                        prompt_title="",
+                        ai_response_code=103,
+                        ai_response_type="Dialog",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "ASK_SPECIALIST_SERVICE":
+                ai_resp_text = prompt or last_state.get("ai_response", "") or settings.SPECIALIST_SERVICE_QUESTION
+                # ensure exact
+                if ai_resp_text != settings.SPECIALIST_SERVICE_QUESTION:
+                    ai_resp_text = settings.SPECIALIST_SERVICE_QUESTION
+
+                response_payload =base_response(
+                        thread_id=req.thread_id,
+                        stage="ASK_SPECIALIST_SERVICE",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=109,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+            
+            elif stage_from_node == "ASK_SPECIALIST_FILTERS":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="ASK_SPECIALIST_FILTERS",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=103,
+                        ai_response_type="Dialog",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+            
+            elif stage_from_node == "PROVIDER_ID_ONLY_WARNING":
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="PROVIDER_ID_ONLY_WARNING",
+                        ai_response=prompt,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=101,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "SHOW_SPECIALIST_PROVIDER_LIST":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="SHOW_SPECIALIST_PROVIDER_LIST",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=107,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "SPECIALIST_PROVIDER_FOLLOWUP_RESPONSE":
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="SPECIALIST_PROVIDER_FOLLOWUP_RESPONSE",
+                        ai_response=prompt or last_state.get("ai_response", ""),
+                        csr_query=req.message or "",
+                        prompts=[],
+                        prompt_title="",
+                        ai_response_code=101,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "SPECIALIST_COMPLETED":
+                # The interrupt prompt is the address JSON.
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "Do you need further assistance?"
+                pr = interrupt_payload.get("prompts") or last_state.get("prompts") or ["Yes", "No"]
+
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="COMPLETED",                 
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=pr,
+                        prompt_title=ptitle,
+                        ai_response_code=110,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "RETURN_TO_MENU":
+                ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or getattr(settings, "MENU_PROMPT_TITLE", "How can I assist you today?")
+                pr = interrupt_payload.get("prompts") or last_state.get("prompts") or settings.DEFAULT_PROMPTS
+
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="START",                 
+                        ai_response="",                
+                        csr_query=req.message or "",
+                        prompts=pr,
+                        prompt_title=ptitle,
+                        ai_response_code=101,
+                        ai_response_type="AURA",
+                        call_source = call_source,
+                    )
+                break # break out of stream loop so we can apply metrics in one place
+
+            elif stage_from_node == "NPI_ASK_MODE":
+                ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "Would you like to search by Zip Code or Name?"
+                pr = interrupt_payload.get("prompts") or last_state.get("prompts") or ["Zip Code", "Name"]
+
+                response_payload = base_response(
+                    thread_id=req.thread_id,
+                    stage="NPI_ASK_MODE",
+                    ai_response="",
+                    csr_query=req.message or "",
+                    prompts=pr,
+                    prompt_title=ptitle,
+                    ai_response_code=101,
+                    ai_response_type="AURA",
+                    call_source=call_source,
+                )
+                break
+
+            elif stage_from_node == "NPI_ASK_QUERY":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+
+                response_payload = base_response(
+                    thread_id=req.thread_id,
+                    stage="NPI_ASK_QUERY",
+                    ai_response=ai_resp_text,
+                    csr_query=req.message or "",
+                    prompts=[],
+                    prompt_title="",
+                    ai_response_code=103,
+                    ai_response_type="Dialog",
+                    call_source=call_source,
+                )
+                break
+
+            elif stage_from_node == "NPI_SHOW_RESULTS":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                menu_after = bool(interrupt_payload.get("menu_after", True))
+
+                if menu_after:
+                    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "How can I assist you today?"
+                    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or settings.DEFAULT_PROMPTS
+                    response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="START",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=pr,
+                        prompt_title=ptitle,
+                        ai_response_code=107,
+                        ai_response_type="AURA",
+                        call_source=call_source,
+                    )
+                else:
+                    # fallback mode: stay in NPI_SHOW_RESULTS so next user message is treated as selection
+                    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
+                    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or []
+                    response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage="NPI_SHOW_RESULTS",
+                        ai_response=ai_resp_text,
+                        csr_query=req.message or "",
+                        prompts=pr,
+                        prompt_title=ptitle,
+                        ai_response_code=107,
+                        ai_response_type="AURA",
+                        call_source=call_source,
+                    )
+                break      
+
+            elif stage_from_node == "PCP_NO_RESULTS_OFFER_NPI":
+                ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
+                pr = interrupt_payload.get("prompts") or last_state.get("prompts") or ["Yes", "No"]
+
+                response_payload = base_response(
+                    thread_id=req.thread_id,
+                    stage="PCP_NO_RESULTS_OFFER_NPI",
+                    ai_response="",
+                    csr_query=req.message or "",
+                    prompts=pr,
+                    prompt_title=ptitle,
+                    ai_response_code=101,
+                    ai_response_type="AURA",
+                    call_source=call_source,
+                )
+                break   
+
+            elif stage_from_node == "ERROR":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
+                ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or ""
+                pr = interrupt_payload.get("prompts")
+                if pr is None:
+                    pr = last_state.get("prompts", [])
+                code = interrupt_payload.get("ai_response_code") or last_state.get("ai_response_code", 500)
+                rtype = interrupt_payload.get("ai_response_type") or last_state.get("ai_response_type", "AURA")
+
+                response_payload = base_response(
+                    thread_id=req.thread_id,
+                    stage="ERROR",
+                    ai_response=ai_resp_text,
+                    csr_query=req.message or "",
+                    prompts=pr,
+                    prompt_title=ptitle,
+                    ai_response_code=code,
+                    ai_response_type=rtype,
+                    call_source=call_source,
+                )
+                break
+
+            # Default handling for any other interrupts
+            else:
+                response_payload = base_response(
+                        thread_id=req.thread_id,
+                        stage = stage_from_node or last_state.get("stage", "") or "",
+                        ai_response=last_state.get("ai_response", ""),
+                        csr_query=req.message or "",
+                        prompts=last_state.get("prompts", []),
+                        prompt_title=last_state.get("prompt_title", ""),
+                        ai_response_code=last_state.get("ai_response_code", 101),
+                        ai_response_type=last_state.get("ai_response_type", "AURA"),
+                        call_source = call_source,
+                        )
+                break # break out of stream loop so we can apply metrics in one place
+        
+        for _, value in event.items():
+            last_state = value
+
+    # Completed
+    # If nothing set inside interrupts, build completed payload
+    if not response_payload:
+        response_payload = base_response(
+            thread_id=req.thread_id,
+            stage=last_state.get("stage", ""),
+            ai_response=last_state.get("ai_response", ""),
+            csr_query=req.message or "",
+            prompts=last_state.get("prompts", []),
+            prompt_title=last_state.get("prompt_title", ""),
+            ai_response_code=last_state.get("ai_response_code", 101),
+            ai_response_type=last_state.get("ai_response_type", "AURA"),
+            call_source=call_source or last_state.get("call_name") or "",
         )
 
-    result = run_cprofile(
-        _run_graph,
-        enabled=profile_enabled,
-        out_dir=getattr(settings, "CPROFILE_DIR", "profiles"),
-        label=f"chat-{req.thread_id}",
-    )
+    # ---------------- metrics finalize (never break API) ----------------
+    try:
+        total_latency_ms = round((perf_counter() - request_start) * 1000, 2)
 
-    return result
+        response_text = ""
+        if isinstance(response_payload, dict):
+            response_text = str(response_payload.get("AIResponse", ""))
+
+        token_usage = {
+            "request_tokens": estimate_tokens(req.message),
+            "response_tokens": estimate_tokens(response_text),
+            "llm_prompt_tokens": telemetry.get("llm_prompt_tokens", 0),
+            "llm_completion_tokens": telemetry.get("llm_completion_tokens", 0),
+        }
+        token_usage["llm_total_tokens"] = token_usage["llm_prompt_tokens"] + token_usage["llm_completion_tokens"]
+        token_usage["total_tokens_all"] = (
+            token_usage["request_tokens"] + token_usage["response_tokens"] + token_usage["llm_total_tokens"]
+        )
+        
+        # Update per-session totals
+        token_usage_totals: Dict[str, float] = {}
+        tid = req.thread_id
+        if tid:
+            with token_totals_lock:
+                totals = SESSION_TOKEN_TOTALS.get(tid) or _blank_token_totals()
+                totals["request_tokens"] += token_usage["request_tokens"]
+                totals["response_tokens"] += token_usage["response_tokens"]
+                totals["llm_prompt_tokens"] += token_usage["llm_prompt_tokens"]
+                totals["llm_completion_tokens"] += token_usage["llm_completion_tokens"]
+                totals["llm_total_tokens"] += token_usage["llm_total_tokens"]
+                totals["total_tokens_all"] += token_usage["total_tokens_all"]
+                SESSION_TOKEN_TOTALS[tid] = totals
+                token_usage_totals = dict(totals)
+        # Attach metrics into API response
+        if isinstance(response_payload, dict):
+            response_payload["LatencyMs"] = total_latency_ms
+            response_payload["LLMLatencyMs"] = round(telemetry.get("llm_latency_ms", 0.0), 2)
+            response_payload["TokenUsage"] = token_usage
+            if token_usage_totals:
+                response_payload["TokenUsageTotals"] = token_usage_totals
+
+        # Logfire event (works even if noop)
+        # logfire.info(
+        #     "chat_request",
+        #     path="/chat",
+        #     latency_ms=total_latency_ms,
+        #     llm_latency_ms=round(float(telemetry.get("llm_latency_ms", 0.0)), 2),
+        #     error=str(error) if error else None,
+        #     **token_usage,
+        #     **({f"total_{k}": v for k, v in token_usage_totals.items()} if token_usage_totals else {}),
+        # )
+        lf = request.app.state.logfire
+
+        lf.info(
+            "chat_request",
+            path="/chat",
+            latency_ms=total_latency_ms,
+            llm_latency_ms=round(telemetry.get("llm_latency_ms", 0.0), 2),
+            error=str(error) if error else None,
+            **token_usage,
+            **({f"total_{k}": v for k, v in token_usage_totals.items()} if token_usage_totals else {}),
+        )
 
 
+        # Persist metrics (CSV -> XLSX best effort)
+        with metrics_lock:
+            total_in = token_usage["request_tokens"] + token_usage["llm_prompt_tokens"]
+            total_out = token_usage["response_tokens"] + token_usage["llm_completion_tokens"]
+            api_hit_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            ai_response = str(response_payload.get("AIResponse", "")) if isinstance(response_payload, dict) else ""
+            prompt_title = str(response_payload.get("PromptTitle", "")) if isinstance(response_payload, dict) else ""
+
+            MAX_CELL_LEN = 32700
+            if len(ai_response) > MAX_CELL_LEN:
+                ai_response = ai_response[:MAX_CELL_LEN]
+            if len(prompt_title) > MAX_CELL_LEN:
+                prompt_title = prompt_title[:MAX_CELL_LEN]
+            _append_metrics_row([
+                tid,
+                req.message or "",
+                ai_response,
+                prompt_title,
+                total_in,
+                total_out,
+                token_usage["total_tokens_all"],
+                total_latency_ms,
+                api_hit_time,
+            ])
+
+    except Exception as exc:
+        logger.warning("Failed to finalize metrics: %s", exc)
+
+    finally:
+        set_llm_telemetry(None)
+
+    return JSONResponse(response_payload)
