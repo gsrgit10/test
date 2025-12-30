@@ -1,9 +1,66 @@
 import cProfile
-def method1():
-    for _ in range(10_000_000):
-        pass
+import os
+import time
+from pathlib import Path
+from typing import Callable, Any, Optional
 
-def method2():
-    pass
+def _safe_filename(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in s)[:180]
 
-cProfile.run("method1(); method2()")
+def run_cprofile(
+    fn: Callable[[], Any],
+    *,
+    enabled: bool,
+    out_dir: str = "profiles",
+    label: str = "request",
+) -> Any:
+    """
+    Runs fn() under cProfile only when enabled=True.
+    Writes a .prof file and returns fn() result.
+    """
+    if not enabled:
+        return fn()
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    prof_path = Path(out_dir) / f"{_safe_filename(label)}-{ts}-{int(time.time() * 1000)}.prof"
+
+    pr = cProfile.Profile()
+    try:
+        pr.enable()
+        return fn()
+    finally:
+        pr.disable()
+        pr.dump_stats(str(prof_path))
+
+
+===============================
+
+from app.utils.profiling import run_cprofile
+from app.config import settings
+
+# Example: /chat endpoint signature
+@router.post("/chat")
+def chat(req: ChatRequest, profile: int = 0):
+    # profile=1 triggers profiling for this request only (safe)
+    profile_enabled = bool(profile)
+
+    def _run_graph():
+        # Whatever you already do here:
+        # result = graph.invoke(...)
+        # OR result = graph.stream(...)
+        return graph.invoke(
+            {"member_id": req.member_id, "csr_query": req.message, "thread_id": req.thread_id},
+            config={"configurable": {"thread_id": req.thread_id}},
+        )
+
+    result = run_cprofile(
+        _run_graph,
+        enabled=profile_enabled,
+        out_dir=getattr(settings, "CPROFILE_DIR", "profiles"),
+        label=f"chat-{req.thread_id}",
+    )
+
+    return result
+
+
