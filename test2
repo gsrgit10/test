@@ -1,47 +1,28 @@
-        # ✅ If NPI returns 0 results, reuse the same "no results -> offer NPI" pattern.
-        if not providers:
-            # Clear cached payload so it never replays an old grid
-            state.pop("npi_results_payload", None)
+def _extract_taxonomy_descs(raw: Dict[str, Any]) -> List[str]:
+    taxonomies = raw.get("taxonomies") or []
+    descs: List[str] = []
+    if isinstance(taxonomies, list):
+        for t in taxonomies:
+            if not isinstance(t, dict):
+                continue
+            d = t.get("desc")
+            if isinstance(d, str) and d.strip():
+                descs.append(d.strip().lower())
+    return descs
 
-            # Horizon generates the question (no hardcode)
-            sys = (
-                "You are a CSR assistant.\n"
-                "The NPI registry search returned no results.\n"
-                "Ask the user if they would like to try NPI search again.\n"
-                "Return ONLY the question text (no JSON, no markdown fences).\n"
-                "The question must mention that no record was found for the provided input.\n"
-            )
-            user = f"No provider record found for: {query}"
 
-            try:
-                ai_msg = call_horizon(sys, user).strip()
-            except requests.exceptions.ReadTimeout:
-                state["ai_response"] = getattr(settings, "TIMEOUT_ERROR_MESSAGE", "Request timed out. Please try again.")
-                state["ai_response_type"] = "AURA"
-                state["ai_response_code"] = 500
-                state["prompt_title"] = ""
-                state["prompts"] = []
-                state["stage"] = "ERROR"
-                return state
+def _is_excluded_specialty(raw: Dict[str, Any]) -> bool:
+    keywords = getattr(settings, "NPI_EXCLUDE_SPECIALTY_KEYWORDS", None) or []
+    keywords = [k.strip().lower() for k in keywords if isinstance(k, str) and k.strip()]
+    if not keywords:
+        return False
 
-            mark_llm(state)
+    descs = _extract_taxonomy_descs(raw)
+    if not descs:
+        return False
 
-            # Reuse the same UI contract as PCP_NO_RESULTS_OFFER_NPI
-            state["ai_response"] = ""
-            state["ai_response_type"] = "AURA"
-            state["ai_response_code"] = 101
-            state["prompt_title"] = ai_msg
-            state["prompts"] = ["Yes", "No"]
-            state["stage"] = "PCP_NO_RESULTS_OFFER_NPI"
-
-            requested = interrupt({
-                "prompt": "",
-                "stage": state["stage"],
-                "prompt_title": state["prompt_title"],
-                "prompts": state["prompts"],
-                "ai_response_code": state["ai_response_code"],
-                "ai_response_type": state["ai_response_type"],
-            })
-
-            state["csr_query"] = str(requested).strip()
-            return state
+    joined = " | ".join(descs)
+    return any(kw in joined for kw in keywords)
+----------------------------------------------
+def normalize_npi_results(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+================================
